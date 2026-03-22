@@ -16,6 +16,8 @@ Advanced Subscription Manager for QX, Loon, Surge, Stash, Egern and Shadowrocket
 
 [📚 文档/DOC](https://github.com/sub-store-org/Sub-Store/wiki)
 
+auto-run
+
 Core functionalities:
 
 1. Conversion among various formats.
