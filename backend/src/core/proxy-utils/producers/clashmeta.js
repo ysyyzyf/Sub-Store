@@ -1,4 +1,9 @@
-import { isPresent } from '@/core/proxy-utils/producers/utils';
+import {
+    getWireGuardAddressWithCIDR,
+    isPresent,
+    produceProxyListOutput,
+    supportsShadowsocksV2rayPluginMode,
+} from '@/core/proxy-utils/producers/utils';
 
 const ipVersions = {
     dual: 'dual',
@@ -14,9 +19,15 @@ export default function ClashMeta_Producer() {
         const list = proxies
             .filter((proxy) => {
                 if (opts['include-unsupported-proxy']) return true;
-                if (proxy.type === 'snell' && proxy.version >= 4) {
+                if (
+                    !supportsShadowsocksV2rayPluginMode(proxy, ['websocket'])
+                ) {
                     return false;
-                } else if (['juicity', 'naive'].includes(proxy.type)) {
+                } else if (proxy.type === 'snell' && proxy.version >= 4) {
+                    return false;
+                } else if (
+                    ['tailscale', 'juicity', 'naive'].includes(proxy.type)
+                ) {
                     return false;
                 } else if (
                     ['ss'].includes(proxy.type) &&
@@ -67,7 +78,10 @@ export default function ClashMeta_Producer() {
                             proxy['reality-opts']))
                 ) {
                     return false;
-                } else if (['xhttp'].includes(proxy.network)) {
+                } else if (
+                    !['vless'].includes(proxy.type) &&
+                    ['xhttp'].includes(proxy.network)
+                ) {
                     return false;
                 }
                 return true;
@@ -150,6 +164,8 @@ export default function ClashMeta_Producer() {
                     proxy['preshared-key'] =
                         proxy['preshared-key'] ?? proxy['pre-shared-key'];
                     proxy['pre-shared-key'] = proxy['preshared-key'];
+                    proxy.ip = getWireGuardAddressWithCIDR(proxy, 'ipv4');
+                    proxy.ipv6 = getWireGuardAddressWithCIDR(proxy, 'ipv6');
                 } else if (proxy.type === 'snell' && proxy.version < 3) {
                     delete proxy.udp;
                 } else if (proxy.type === 'vless') {
@@ -157,6 +173,15 @@ export default function ClashMeta_Producer() {
                         proxy.servername = proxy.sni;
                         delete proxy.sni;
                     }
+                    // Mihomo 的运行时校验（`adapter/outbound/vless.go`）
+                    // 会先把 flow 截断到 16 个字符，并且只接受
+                    // `xtls-rprx-vision`。`xtls-rprx-direct`、
+                    // `xtls-rprx-unknown` 等值在 Mihomo 加载时会报错。
+                    //
+                    // 另外，xhttp 使用 `alpn: [h3]` 时必须启用 TLS，
+                    // 且不能启用 Reality；这条限制同时作用于根 xhttp
+                    // 配置，以及继承根配置默认值后的嵌套
+                    // `download-settings`。
                 } else if (proxy.type === 'ss') {
                     if (
                         isPresent(proxy, 'shadow-tls-password') &&
@@ -237,6 +262,7 @@ export default function ClashMeta_Producer() {
                 if (proxy['plugin-opts']?.tls) {
                     if (isPresent(proxy, 'skip-cert-verify')) {
                         proxy['plugin-opts']['skip-cert-verify'] =
+                            proxy['plugin-opts']['skip-cert-verify'] ||
                             proxy['skip-cert-verify'];
                     }
                 }
@@ -273,6 +299,8 @@ export default function ClashMeta_Producer() {
                 delete proxy.id;
                 delete proxy.resolved;
                 delete proxy['no-resolve'];
+                delete proxy['ip-cidr'];
+                delete proxy['ipv6-cidr'];
                 if (type !== 'internal' || opts['delete-underscore-fields']) {
                     for (const key in proxy) {
                         if (proxy[key] == null || /^_/i.test(key)) {
@@ -295,12 +323,7 @@ export default function ClashMeta_Producer() {
                 return proxy;
             });
 
-        return type === 'internal'
-            ? list
-            : 'proxies:\n' +
-                  list
-                      .map((proxy) => '  - ' + JSON.stringify(proxy) + '\n')
-                      .join('');
+        return produceProxyListOutput(list, type, opts);
     };
     return { type, produce };
 }

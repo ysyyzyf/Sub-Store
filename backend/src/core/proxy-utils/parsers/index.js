@@ -6,6 +6,7 @@ import {
     isNotBlank,
     getIfPresent,
     getRandomPort,
+    isPlainObject,
 } from '@/utils';
 import getSurgeParser from './peggy/surge';
 import getLoonParser from './peggy/loon';
@@ -17,6 +18,12 @@ import YAML from '@/utils/yaml';
 import _ from 'lodash';
 
 import { Base64 } from 'js-base64';
+import {
+    normalizeXhttpIntegerValue,
+    normalizeXhttpNonNegativeRange,
+    normalizeXhttpPositiveRange,
+    normalizeXhttpScalarUpperBound,
+} from '../xhttp-utils';
 
 function surge_port_hopping(raw) {
     const [parts, port_hopping] =
@@ -29,6 +36,44 @@ function surge_port_hopping(raw) {
             : undefined,
         line: parts ? raw.replace(parts, '') : raw,
     };
+}
+
+function splitURIFragment(raw) {
+    const [__, content, fragment] = /^(.*?)(?:#(.*?))?$/.exec(raw);
+    return {
+        content,
+        fragment: fragment != null ? decodeURIComponent(fragment) : undefined,
+    };
+}
+
+function parseWireGuardURIAddressValue(value) {
+    if (value == null) return null;
+    const raw = `${value}`.trim();
+    if (!raw) return null;
+    const [, hostRaw = raw, cidrRaw] = /^(.*?)(?:\/(\d+))?$/.exec(raw) || [];
+    const host = `${hostRaw}`.trim().replace(/^\[/, '').replace(/\]$/, '');
+    const normalizeCIDR = (cidr, max) => {
+        if (cidr == null) return undefined;
+        if (!/^\d+$/.test(cidr)) return undefined;
+        const parsed = parseInt(cidr, 10);
+        if (parsed < 0 || parsed > max) return undefined;
+        return parsed;
+    };
+    if (isIPv4(host)) {
+        return {
+            family: 'ipv4',
+            address: host,
+            cidr: normalizeCIDR(cidrRaw, 32),
+        };
+    }
+    if (isIPv6(host)) {
+        return {
+            family: 'ipv6',
+            address: host,
+            cidr: normalizeCIDR(cidrRaw, 128),
+        };
+    }
+    return null;
 }
 
 function URI_PROXY() {
@@ -128,13 +173,12 @@ function URI_SS() {
     };
     const parse = (line) => {
         // parse url
-        let content = line.split('ss://')[1];
-
-        let name = line.split('#')[1];
+        let { content, fragment: name } = splitURIFragment(
+            line.split('ss://')[1],
+        );
         const proxy = {
             type: 'ss',
         };
-        content = content.split('#')[0]; // strip proxy name
         // handle IPV4 and IPV6
         let serverAndPortArray = content.match(/@([^/?]*)(\/|\?|$)/);
 
@@ -287,8 +331,14 @@ function URI_SS() {
             ).split(';');
             const params = {};
             for (const item of pluginInfo) {
-                const [key, val] = item.split('=');
-                if (key) params[key] = val || true; // some options like "tls" will not have value
+                const separatorIndex = item.indexOf('=');
+                if (separatorIndex === -1) {
+                    if (item) params[item] = true; // some options like "tls" will not have value
+                    continue;
+                }
+                const key = item.slice(0, separatorIndex);
+                const val = item.slice(separatorIndex + 1).replace(/\\=/g, '=');
+                if (key) params[key] = val || true;
             }
             switch (params.plugin) {
                 case 'obfs-local':
@@ -302,12 +352,22 @@ function URI_SS() {
                 case 'v2ray-plugin':
                     proxy.plugin = 'v2ray-plugin';
                     proxy['plugin-opts'] = {
-                        mode: 'websocket',
+                        mode:
+                            getIfNotBlank(params['obfs']) ||
+                            getIfNotBlank(params['mode']) ||
+                            'websocket',
                         host:
                             getIfNotBlank(params['obfs-host']) ||
                             getIfNotBlank(params['host']),
                         path: getIfNotBlank(params.path),
                         tls: getIfPresent(params.tls),
+                        sni: getIfPresent(params.sni),
+                        'skip-cert-verify': ['1', 'true', 1, true].includes(
+                            params['skip-cert-verify'],
+                        ),
+                        mux: /^\d+$/.test(params.mux)
+                            ? parseInt(params.mux, 10)
+                            : undefined,
                     };
                     break;
                 case 'shadow-tls': {
@@ -350,9 +410,6 @@ function URI_SS() {
         }
         if (/(&|\?)tfo=(1|true)/i.test(query)) {
             proxy.tfo = true;
-        }
-        if (name != null) {
-            name = decodeURIComponent(name);
         }
         proxy.name = name ?? `SS ${proxy.server}:${proxy.port}`;
         return proxy;
@@ -436,8 +493,9 @@ function URI_VMess() {
         return /^vmess:\/\//.test(line);
     };
     const parse = (line) => {
-        line = line.split('vmess://')[1];
-        let content = Base64.decode(line.replace(/\?.*?$/, ''));
+        let { content: lineWithoutFragment, fragment: fragmentName } =
+            splitURIFragment(line.split('vmess://')[1]);
+        let content = Base64.decode(lineWithoutFragment.replace(/\?.*?$/, ''));
         if (/=\s*vmess/.test(content)) {
             // Quantumult VMess URI format
             const partitions = content.split(',').map((p) => p.trim());
@@ -487,6 +545,9 @@ function URI_VMess() {
                     throw new Error(`Unsupported obfs: ${params.obfs}`);
                 }
             }
+            if (isNotBlank(fragmentName)) {
+                proxy.name = fragmentName;
+            }
             return proxy;
         } else {
             let params = {};
@@ -497,7 +558,9 @@ function URI_VMess() {
             } catch (e) {
                 // Shadowrocket URI format
                 // eslint-disable-next-line no-unused-vars
-                let [__, base64Line, qs] = /(^[^?]+?)\/?\?(.*)$/.exec(line);
+                let [__, base64Line, qs] = /(^[^?]+?)\/?\?(.*)$/.exec(
+                    lineWithoutFragment,
+                );
                 content = Base64.decode(base64Line);
 
                 for (const addon of qs.split('&')) {
@@ -666,6 +729,9 @@ function URI_VMess() {
             proxy.alpn = params.alpn ? params.alpn.split(',') : undefined;
             // 然而 wiki 和 app 实测中都没有字段表示这个
             // proxy['skip-cert-verify'] = /(TRUE)|1/i.test(params.allowInsecure);
+            if (isNotBlank(fragmentName)) {
+                proxy.name = fragmentName;
+            }
 
             return proxy;
         }
@@ -679,6 +745,779 @@ function URI_VLESS() {
         return /^vless:\/\//.test(line);
     };
     const parse = (line) => {
+        const mapXmuxToReuseSettings = (xmux) => {
+            if (!isPlainObject(xmux)) {
+                return undefined;
+            }
+
+            const reuseSettings = {};
+            const xmuxFieldMap = {
+                maxConnections: 'max-connections',
+                maxConcurrency: 'max-concurrency',
+                cMaxReuseTimes: 'c-max-reuse-times',
+                hMaxRequestTimes: 'h-max-request-times',
+                hMaxReusableSecs: 'h-max-reusable-secs',
+            };
+
+            for (const [sourceKey, targetKey] of Object.entries(xmuxFieldMap)) {
+                const normalizedValue = normalizeXhttpNonNegativeRange(
+                    xmux[sourceKey],
+                );
+                if (normalizedValue != null) {
+                    reuseSettings[targetKey] =
+                        typeof normalizedValue === 'number'
+                            ? `${normalizedValue}`
+                            : normalizedValue;
+                }
+            }
+
+            const hKeepAlivePeriod = normalizeXhttpIntegerValue(
+                xmux.hKeepAlivePeriod,
+            );
+            if (hKeepAlivePeriod != null) {
+                reuseSettings['h-keep-alive-period'] = hKeepAlivePeriod;
+            }
+
+            return Object.keys(reuseSettings).length > 0
+                ? reuseSettings
+                : undefined;
+        };
+
+        const toStringHeaderMap = (headers) => {
+            if (!isPlainObject(headers)) {
+                return undefined;
+            }
+
+            const parsedHeaders = {};
+            for (const [key, value] of Object.entries(headers)) {
+                if (typeof value === 'string' && value !== '') {
+                    parsedHeaders[key] = value;
+                }
+            }
+
+            return Object.keys(parsedHeaders).length > 0
+                ? parsedHeaders
+                : undefined;
+        };
+
+        const cloneUnsupportedXhttpValue = (value) => {
+            if (Array.isArray(value)) {
+                return value.map(cloneUnsupportedXhttpValue);
+            }
+
+            if (isPlainObject(value)) {
+                const clonedValue = {};
+                for (const [key, entryValue] of Object.entries(value)) {
+                    clonedValue[key] = cloneUnsupportedXhttpValue(entryValue);
+                }
+                return clonedValue;
+            }
+
+            return value;
+        };
+
+        const compactUnsupportedXhttpValue = (value) => {
+            if (Array.isArray(value)) {
+                return value
+                    .map(compactUnsupportedXhttpValue)
+                    .filter((entryValue) => entryValue !== undefined);
+            }
+
+            if (!isPlainObject(value)) {
+                return value;
+            }
+
+            const compactedValue = {};
+            for (const [key, entryValue] of Object.entries(value)) {
+                const compactedEntryValue =
+                    compactUnsupportedXhttpValue(entryValue);
+                if (compactedEntryValue !== undefined) {
+                    compactedValue[key] = compactedEntryValue;
+                }
+            }
+
+            return Object.keys(compactedValue).length > 0
+                ? compactedValue
+                : undefined;
+        };
+
+        const setUnsupportedXhttpField = (target, key, value) => {
+            const normalizedValue = compactUnsupportedXhttpValue(
+                cloneUnsupportedXhttpValue(value),
+            );
+            if (normalizedValue !== undefined) {
+                target[key] = normalizedValue;
+            }
+        };
+
+        const collectUnsupportedXhttpHeaders = (headers) => {
+            if (headers == null) {
+                return undefined;
+            }
+
+            if (!isPlainObject(headers)) {
+                return cloneUnsupportedXhttpValue(headers);
+            }
+
+            const unsupportedHeaders = {};
+            for (const [key, value] of Object.entries(headers)) {
+                if (typeof value === 'string' && value !== '') {
+                    continue;
+                }
+
+                setUnsupportedXhttpField(unsupportedHeaders, key, value);
+            }
+
+            return compactUnsupportedXhttpValue(unsupportedHeaders);
+        };
+
+        const isSupportedXmuxFieldValue = (key, value) => {
+            if (
+                [
+                    'maxConnections',
+                    'maxConcurrency',
+                    'cMaxReuseTimes',
+                    'hMaxRequestTimes',
+                    'hMaxReusableSecs',
+                ].includes(key)
+            ) {
+                return normalizeXhttpNonNegativeRange(value) != null;
+            }
+
+            if (key === 'hKeepAlivePeriod') {
+                return normalizeXhttpIntegerValue(value) != null;
+            }
+
+            return false;
+        };
+
+        const collectUnsupportedXmux = (xmux) => {
+            if (xmux == null) {
+                return undefined;
+            }
+
+            if (!isPlainObject(xmux)) {
+                return cloneUnsupportedXhttpValue(xmux);
+            }
+
+            const unsupportedXmux = {};
+            for (const [key, value] of Object.entries(xmux)) {
+                if (isSupportedXmuxFieldValue(key, value)) {
+                    continue;
+                }
+
+                setUnsupportedXhttpField(unsupportedXmux, key, value);
+            }
+
+            return compactUnsupportedXhttpValue(unsupportedXmux);
+        };
+
+        const collectUnsupportedXhttpExtra = (extra) => {
+            if (extra == null) {
+                return undefined;
+            }
+
+            if (!isPlainObject(extra)) {
+                return cloneUnsupportedXhttpValue(extra);
+            }
+
+            const unsupportedExtra = {};
+            for (const [key, value] of Object.entries(extra)) {
+                switch (key) {
+                    case 'headers': {
+                        const unsupportedHeaders =
+                            collectUnsupportedXhttpHeaders(value);
+                        if (unsupportedHeaders !== undefined) {
+                            unsupportedExtra.headers = unsupportedHeaders;
+                        }
+                        break;
+                    }
+                    case 'noGRPCHeader':
+                    case 'xPaddingObfsMode':
+                        if (value !== true) {
+                            setUnsupportedXhttpField(
+                                unsupportedExtra,
+                                key,
+                                value,
+                            );
+                        }
+                        break;
+                    case 'xPaddingBytes':
+                    case 'xPaddingKey':
+                    case 'xPaddingHeader':
+                    case 'xPaddingPlacement':
+                    case 'xPaddingMethod':
+                    case 'uplinkHTTPMethod':
+                    case 'sessionPlacement':
+                    case 'sessionKey':
+                    case 'seqPlacement':
+                    case 'seqKey':
+                    case 'uplinkDataPlacement':
+                    case 'uplinkDataKey':
+                        if (!isNotBlank(value)) {
+                            setUnsupportedXhttpField(
+                                unsupportedExtra,
+                                key,
+                                value,
+                            );
+                        }
+                        break;
+                    case 'uplinkChunkSize':
+                        if (normalizeXhttpNonNegativeRange(value) == null) {
+                            setUnsupportedXhttpField(
+                                unsupportedExtra,
+                                key,
+                                value,
+                            );
+                        }
+                        break;
+                    case 'scMaxEachPostBytes':
+                        if (normalizeXhttpScalarUpperBound(value) == null) {
+                            setUnsupportedXhttpField(
+                                unsupportedExtra,
+                                key,
+                                value,
+                            );
+                        }
+                        break;
+                    case 'scMinPostsIntervalMs':
+                        if (normalizeXhttpPositiveRange(value) == null) {
+                            setUnsupportedXhttpField(
+                                unsupportedExtra,
+                                key,
+                                value,
+                            );
+                        }
+                        break;
+                    case 'xmux': {
+                        const unsupportedXmux = collectUnsupportedXmux(value);
+                        if (unsupportedXmux !== undefined) {
+                            unsupportedExtra.xmux = unsupportedXmux;
+                        }
+                        break;
+                    }
+                    default:
+                        setUnsupportedXhttpField(unsupportedExtra, key, value);
+                        break;
+                }
+            }
+
+            return compactUnsupportedXhttpValue(unsupportedExtra);
+        };
+
+        const collectUnsupportedNestedXhttpSettings = (xhttpSettings) => {
+            if (xhttpSettings == null) {
+                return undefined;
+            }
+
+            if (!isPlainObject(xhttpSettings)) {
+                return cloneUnsupportedXhttpValue(xhttpSettings);
+            }
+
+            const unsupportedXhttpSettings = {};
+            if (
+                Object.prototype.hasOwnProperty.call(xhttpSettings, 'path') &&
+                !isNotBlank(xhttpSettings.path)
+            ) {
+                setUnsupportedXhttpField(
+                    unsupportedXhttpSettings,
+                    'path',
+                    xhttpSettings.path,
+                );
+            }
+            if (
+                Object.prototype.hasOwnProperty.call(xhttpSettings, 'host') &&
+                !isNotBlank(xhttpSettings.host)
+            ) {
+                setUnsupportedXhttpField(
+                    unsupportedXhttpSettings,
+                    'host',
+                    xhttpSettings.host,
+                );
+            }
+
+            const inlineExtra = {};
+            for (const [key, value] of Object.entries(xhttpSettings)) {
+                if (['path', 'host', 'extra'].includes(key)) {
+                    continue;
+                }
+                inlineExtra[key] = value;
+            }
+
+            const unsupportedInlineExtra =
+                collectUnsupportedXhttpExtra(inlineExtra);
+            if (isPlainObject(unsupportedInlineExtra)) {
+                Object.assign(unsupportedXhttpSettings, unsupportedInlineExtra);
+            }
+
+            if (Object.prototype.hasOwnProperty.call(xhttpSettings, 'extra')) {
+                const unsupportedExtra = collectUnsupportedXhttpExtra(
+                    xhttpSettings.extra,
+                );
+                if (unsupportedExtra !== undefined) {
+                    unsupportedXhttpSettings.extra = unsupportedExtra;
+                }
+            }
+
+            return compactUnsupportedXhttpValue(unsupportedXhttpSettings);
+        };
+
+        const collectUnsupportedDownloadSettings = (downloadSettings) => {
+            if (downloadSettings == null) {
+                return undefined;
+            }
+
+            if (!isPlainObject(downloadSettings)) {
+                return cloneUnsupportedXhttpValue(downloadSettings);
+            }
+
+            const unsupportedDownloadSettings = {};
+            for (const [key, value] of Object.entries(downloadSettings)) {
+                switch (key) {
+                    case 'address':
+                        if (!isNotBlank(value)) {
+                            setUnsupportedXhttpField(
+                                unsupportedDownloadSettings,
+                                key,
+                                value,
+                            );
+                        }
+                        break;
+                    case 'port':
+                        if (
+                            normalizeXhttpIntegerValue(value, {
+                                allowNegative: false,
+                            }) == null
+                        ) {
+                            setUnsupportedXhttpField(
+                                unsupportedDownloadSettings,
+                                key,
+                                value,
+                            );
+                        }
+                        break;
+                    case 'security': {
+                        const normalizedSecurity =
+                            typeof value === 'string' ? value.toLowerCase() : '';
+                        if (!['tls', 'reality'].includes(normalizedSecurity)) {
+                            setUnsupportedXhttpField(
+                                unsupportedDownloadSettings,
+                                key,
+                                value,
+                            );
+                        }
+                        break;
+                    }
+                    case 'tlsSettings': {
+                        if (!isPlainObject(value)) {
+                            setUnsupportedXhttpField(
+                                unsupportedDownloadSettings,
+                                key,
+                                value,
+                            );
+                            break;
+                        }
+
+                        const unsupportedTlsSettings = {};
+                        for (const [tlsKey, tlsValue] of Object.entries(value)) {
+                            switch (tlsKey) {
+                                case 'serverName':
+                                case 'fingerprint':
+                                case 'echConfigList':
+                                    if (!isNotBlank(tlsValue)) {
+                                        setUnsupportedXhttpField(
+                                            unsupportedTlsSettings,
+                                            tlsKey,
+                                            tlsValue,
+                                        );
+                                    }
+                                    break;
+                                case 'alpn':
+                                    if (
+                                        !(
+                                            Array.isArray(tlsValue) &&
+                                            tlsValue.length > 0 &&
+                                            tlsValue.every(
+                                                (item) =>
+                                                    typeof item === 'string' &&
+                                                    item !== '',
+                                            )
+                                        )
+                                    ) {
+                                        setUnsupportedXhttpField(
+                                            unsupportedTlsSettings,
+                                            tlsKey,
+                                            tlsValue,
+                                        );
+                                    }
+                                    break;
+                                case 'allowInsecure':
+                                    if (tlsValue !== true) {
+                                        setUnsupportedXhttpField(
+                                            unsupportedTlsSettings,
+                                            tlsKey,
+                                            tlsValue,
+                                        );
+                                    }
+                                    break;
+                                default:
+                                    setUnsupportedXhttpField(
+                                        unsupportedTlsSettings,
+                                        tlsKey,
+                                        tlsValue,
+                                    );
+                                    break;
+                            }
+                        }
+
+                        const compactedTlsSettings =
+                            compactUnsupportedXhttpValue(
+                                unsupportedTlsSettings,
+                            );
+                        if (compactedTlsSettings !== undefined) {
+                            unsupportedDownloadSettings.tlsSettings =
+                                compactedTlsSettings;
+                        }
+                        break;
+                    }
+                    case 'realitySettings': {
+                        if (!isPlainObject(value)) {
+                            setUnsupportedXhttpField(
+                                unsupportedDownloadSettings,
+                                key,
+                                value,
+                            );
+                            break;
+                        }
+
+                        const unsupportedRealitySettings = {};
+                        for (const [realityKey, realityValue] of Object.entries(
+                            value,
+                        )) {
+                            switch (realityKey) {
+                                case 'publicKey':
+                                case 'shortId':
+                                case 'serverName':
+                                case 'fingerprint':
+                                    if (!isNotBlank(realityValue)) {
+                                        setUnsupportedXhttpField(
+                                            unsupportedRealitySettings,
+                                            realityKey,
+                                            realityValue,
+                                        );
+                                    }
+                                    break;
+                                default:
+                                    setUnsupportedXhttpField(
+                                        unsupportedRealitySettings,
+                                        realityKey,
+                                        realityValue,
+                                    );
+                                    break;
+                            }
+                        }
+
+                        const compactedRealitySettings =
+                            compactUnsupportedXhttpValue(
+                                unsupportedRealitySettings,
+                            );
+                        if (compactedRealitySettings !== undefined) {
+                            unsupportedDownloadSettings.realitySettings =
+                                compactedRealitySettings;
+                        }
+                        break;
+                    }
+                    case 'xhttpSettings': {
+                        const unsupportedXhttpSettings =
+                            collectUnsupportedNestedXhttpSettings(value);
+                        if (unsupportedXhttpSettings !== undefined) {
+                            unsupportedDownloadSettings.xhttpSettings =
+                                unsupportedXhttpSettings;
+                        }
+                        break;
+                    }
+                    case 'network': {
+                        const normalizedNetwork =
+                            typeof value === 'string' ? value.toLowerCase() : '';
+                        if (
+                            normalizedNetwork !== 'xhttp' &&
+                            normalizedNetwork !== 'splithttp'
+                        ) {
+                            setUnsupportedXhttpField(
+                                unsupportedDownloadSettings,
+                                key,
+                                value,
+                            );
+                        }
+                        break;
+                    }
+                    default:
+                        setUnsupportedXhttpField(
+                            unsupportedDownloadSettings,
+                            key,
+                            value,
+                        );
+                        break;
+                }
+            }
+
+            return compactUnsupportedXhttpValue(unsupportedDownloadSettings);
+        };
+
+        const collectUnsupportedRootXhttpExtra = (
+            extra,
+            { parsedDownloadSettings } = {},
+        ) => {
+            if (!isPlainObject(extra)) {
+                return undefined;
+            }
+
+            const {
+                downloadSettings: rawDownloadSettings,
+                ...rootInlineExtra
+            } = extra;
+
+            const unsupportedExtra =
+                collectUnsupportedXhttpExtra(rootInlineExtra) || {};
+
+            if (
+                Object.prototype.hasOwnProperty.call(extra, 'downloadSettings')
+            ) {
+                const unsupportedDownloadSettings =
+                    collectUnsupportedDownloadSettings(rawDownloadSettings);
+                if (unsupportedDownloadSettings !== undefined) {
+                    unsupportedExtra.downloadSettings =
+                        unsupportedDownloadSettings;
+                }
+            }
+
+            return compactUnsupportedXhttpValue(unsupportedExtra);
+        };
+
+        const applyXhttpExtraFields = (target, extra) => {
+            if (!isPlainObject(target) || !isPlainObject(extra)) {
+                return;
+            }
+
+            const parsedHeaders = toStringHeaderMap(extra.headers);
+            if (parsedHeaders) {
+                const headers = { ...(target.headers || {}) };
+                for (const [key, value] of Object.entries(parsedHeaders)) {
+                    if (/^host$/i.test(key)) {
+                        if (
+                            !Object.prototype.hasOwnProperty.call(
+                                headers,
+                                'Host',
+                            ) &&
+                            !Object.prototype.hasOwnProperty.call(
+                                headers,
+                                'host',
+                            )
+                        ) {
+                            headers.Host = value;
+                        }
+                        continue;
+                    }
+                    headers[key] = value;
+                }
+                if (Object.keys(headers).length > 0) {
+                    target.headers = headers;
+                }
+            }
+
+            if (extra.noGRPCHeader === true) {
+                target['no-grpc-header'] = true;
+            }
+            if (isNotBlank(extra.xPaddingBytes)) {
+                target['x-padding-bytes'] = extra.xPaddingBytes;
+            }
+            if (extra.xPaddingObfsMode === true) {
+                target['x-padding-obfs-mode'] = true;
+            }
+            if (isNotBlank(extra.xPaddingKey)) {
+                target['x-padding-key'] = extra.xPaddingKey;
+            }
+            if (isNotBlank(extra.xPaddingHeader)) {
+                target['x-padding-header'] = extra.xPaddingHeader;
+            }
+            if (isNotBlank(extra.xPaddingPlacement)) {
+                target['x-padding-placement'] = extra.xPaddingPlacement;
+            }
+            if (isNotBlank(extra.xPaddingMethod)) {
+                target['x-padding-method'] = extra.xPaddingMethod;
+            }
+            if (isNotBlank(extra.uplinkHTTPMethod)) {
+                target['uplink-http-method'] = extra.uplinkHTTPMethod;
+            }
+            if (isNotBlank(extra.sessionPlacement)) {
+                target['session-placement'] = extra.sessionPlacement;
+            }
+            if (isNotBlank(extra.sessionKey)) {
+                target['session-key'] = extra.sessionKey;
+            }
+            if (isNotBlank(extra.seqPlacement)) {
+                target['seq-placement'] = extra.seqPlacement;
+            }
+            if (isNotBlank(extra.seqKey)) {
+                target['seq-key'] = extra.seqKey;
+            }
+            if (isNotBlank(extra.uplinkDataPlacement)) {
+                target['uplink-data-placement'] = extra.uplinkDataPlacement;
+            }
+            if (isNotBlank(extra.uplinkDataKey)) {
+                target['uplink-data-key'] = extra.uplinkDataKey;
+            }
+
+            const uplinkChunkSize = normalizeXhttpNonNegativeRange(
+                extra.uplinkChunkSize,
+            );
+            if (uplinkChunkSize != null) {
+                target['uplink-chunk-size'] = uplinkChunkSize;
+            }
+
+            const scMaxEachPostBytes = normalizeXhttpScalarUpperBound(
+                extra.scMaxEachPostBytes,
+            );
+            if (scMaxEachPostBytes != null) {
+                target['sc-max-each-post-bytes'] = scMaxEachPostBytes;
+            }
+
+            const scMinPostsIntervalMs = normalizeXhttpPositiveRange(
+                extra.scMinPostsIntervalMs,
+            );
+            if (scMinPostsIntervalMs != null) {
+                target['sc-min-posts-interval-ms'] = scMinPostsIntervalMs;
+            }
+
+            const reuseSettings = mapXmuxToReuseSettings(extra.xmux);
+            if (reuseSettings) {
+                target['reuse-settings'] = reuseSettings;
+            }
+        };
+
+        const parseDownloadSettings = (downloadSettings) => {
+            if (!isPlainObject(downloadSettings)) {
+                return undefined;
+            }
+
+            const parsedDownloadSettings = {};
+            const downloadNetwork =
+                typeof downloadSettings.network === 'string'
+                    ? downloadSettings.network.toLowerCase()
+                    : '';
+            if (
+                downloadNetwork === 'xhttp' ||
+                downloadNetwork === 'splithttp'
+            ) {
+                parsedDownloadSettings.network = 'xhttp';
+            }
+            if (isNotBlank(downloadSettings.address)) {
+                parsedDownloadSettings.server = downloadSettings.address;
+            }
+
+            const parsedPort = normalizeXhttpIntegerValue(
+                downloadSettings.port,
+                {
+                    allowNegative: false,
+                },
+            );
+            if (parsedPort != null) {
+                parsedDownloadSettings.port = parsedPort;
+            }
+
+            const downloadSecurity =
+                typeof downloadSettings.security === 'string'
+                    ? downloadSettings.security.toLowerCase()
+                    : '';
+            if (downloadSecurity === 'tls' || downloadSecurity === 'reality') {
+                parsedDownloadSettings.tls = true;
+            }
+
+            if (isPlainObject(downloadSettings.tlsSettings)) {
+                if (isNotBlank(downloadSettings.tlsSettings.serverName)) {
+                    parsedDownloadSettings.servername =
+                        downloadSettings.tlsSettings.serverName;
+                }
+                if (isNotBlank(downloadSettings.tlsSettings.fingerprint)) {
+                    parsedDownloadSettings['client-fingerprint'] =
+                        downloadSettings.tlsSettings.fingerprint;
+                }
+                if (
+                    Array.isArray(downloadSettings.tlsSettings.alpn) &&
+                    downloadSettings.tlsSettings.alpn.length > 0 &&
+                    downloadSettings.tlsSettings.alpn.every(
+                        (item) => typeof item === 'string' && item !== '',
+                    )
+                ) {
+                    parsedDownloadSettings.alpn =
+                        downloadSettings.tlsSettings.alpn;
+                }
+                if (downloadSettings.tlsSettings.allowInsecure === true) {
+                    parsedDownloadSettings['skip-cert-verify'] = true;
+                }
+                if (isNotBlank(downloadSettings.tlsSettings.echConfigList)) {
+                    parsedDownloadSettings['ech-opts'] = {
+                        enable: true,
+                        config: downloadSettings.tlsSettings.echConfigList,
+                    };
+                }
+            }
+
+            let realityOpts;
+            if (isPlainObject(downloadSettings.realitySettings)) {
+                realityOpts = {};
+                if (isNotBlank(downloadSettings.realitySettings.publicKey)) {
+                    realityOpts['public-key'] =
+                        downloadSettings.realitySettings.publicKey;
+                }
+                if (isNotBlank(downloadSettings.realitySettings.shortId)) {
+                    realityOpts['short-id'] =
+                        downloadSettings.realitySettings.shortId;
+                }
+                if (isNotBlank(downloadSettings.realitySettings.serverName)) {
+                    parsedDownloadSettings.servername =
+                        downloadSettings.realitySettings.serverName;
+                }
+                if (isNotBlank(downloadSettings.realitySettings.fingerprint)) {
+                    parsedDownloadSettings['client-fingerprint'] =
+                        downloadSettings.realitySettings.fingerprint;
+                }
+            }
+            if (downloadSecurity === 'reality') {
+                // Keep an explicit empty reality marker so the producer can
+                // route invalid nested Reality configs through the shared
+                // "missing public-key" export rejection path.
+                parsedDownloadSettings['reality-opts'] = realityOpts || {};
+            } else if (realityOpts && Object.keys(realityOpts).length > 0) {
+                parsedDownloadSettings['reality-opts'] = realityOpts;
+            }
+
+            if (isPlainObject(downloadSettings.xhttpSettings)) {
+                if (isNotBlank(downloadSettings.xhttpSettings.path)) {
+                    parsedDownloadSettings.path =
+                        downloadSettings.xhttpSettings.path;
+                }
+                if (isNotBlank(downloadSettings.xhttpSettings.host)) {
+                    parsedDownloadSettings.host =
+                        downloadSettings.xhttpSettings.host;
+                }
+                applyXhttpExtraFields(
+                    parsedDownloadSettings,
+                    downloadSettings.xhttpSettings,
+                );
+                if (isPlainObject(downloadSettings.xhttpSettings.extra)) {
+                    applyXhttpExtraFields(
+                        parsedDownloadSettings,
+                        downloadSettings.xhttpSettings.extra,
+                    );
+                }
+            }
+
+            return Object.keys(parsedDownloadSettings).length > 0
+                ? parsedDownloadSettings
+                : undefined;
+        };
+
         line = line.split('vless://')[1];
         let isShadowrocket;
         let parsed = /^(.*?)@(.*?):(\d+)\/?(\?(.*?))?(?:#(.*?))?$/.exec(line);
@@ -707,6 +1546,7 @@ function URI_VLESS() {
             server,
             port,
             uuid,
+            udp: true,
         };
         const params = {};
         for (const addon of addons.split('&')) {
@@ -725,6 +1565,9 @@ function URI_VLESS() {
             `VLESS ${server}:${port}`;
 
         proxy.tls = params.security && params.security !== 'none';
+        if (params.pbk) {
+            params.security = 'reality';
+        }
         if (isShadowrocket && /TRUE|1/i.test(params.tls)) {
             proxy.tls = true;
             params.security = params.security ?? 'reality';
@@ -744,8 +1587,19 @@ function URI_VLESS() {
         proxy.alpn = params.alpn ? params.alpn.split(',') : undefined;
         proxy['skip-cert-verify'] = /(TRUE)|1/i.test(params.allowInsecure);
         proxy._echConfigList = getIfPresent(params.ech);
-        proxy._pcs = getIfPresent(params.pcs);
+        proxy['tls-fingerprint'] = getIfPresent(params.pcs);
         proxy._h2 = /(TRUE)|1/i.test(params.h2);
+
+        switch (`${params.packetEncoding || ''}`.toLowerCase()) {
+            case 'none':
+                break;
+            case 'packet':
+                proxy['packet-addr'] = true;
+                break;
+            default:
+                proxy.xudp = true;
+                break;
+        }
 
         if (['reality'].includes(params.security)) {
             const opts = {};
@@ -764,14 +1618,16 @@ function URI_VLESS() {
             }
         }
         let httpupgrade = false;
-        proxy.network = params.type;
+        proxy.network = params.type || 'tcp';
         if (proxy.network === 'tcp' && params.headerType === 'http') {
             proxy.network = 'http';
+        } else if (proxy.network === 'http') {
+            proxy.network = 'h2';
         } else if (proxy.network === 'httpupgrade') {
             proxy.network = 'ws';
             httpupgrade = true;
         }
-        if (!proxy.network && isShadowrocket && params.obfs) {
+        if (!params.type && isShadowrocket && params.obfs) {
             proxy.network = params.obfs;
             if (['none'].includes(proxy.network)) {
                 proxy.network = 'tcp';
@@ -810,6 +1666,9 @@ function URI_VLESS() {
             if (params.path) {
                 opts.path = params.path;
             }
+            if (proxy.network === 'http' && params.method) {
+                opts.method = params.method;
+            }
             // https://github.com/XTLS/Xray-core/issues/91
             if (['grpc'].includes(proxy.network)) {
                 opts['_grpc-type'] = params.mode || 'gun';
@@ -817,6 +1676,30 @@ function URI_VLESS() {
             if (httpupgrade) {
                 opts['v2ray-http-upgrade'] = true;
                 opts['v2ray-http-upgrade-fast-open'] = true;
+            }
+            if (params.ed) {
+                const maxEarlyDataRaw = `${params.ed}`;
+                if (!/^\d+$/.test(maxEarlyDataRaw)) {
+                    throw new Error(
+                        `bad WebSocket max early data size: ${params.ed}`,
+                    );
+                }
+                const maxEarlyData = parseInt(maxEarlyDataRaw, 10);
+                if (!Number.isSafeInteger(maxEarlyData)) {
+                    throw new Error(
+                        `bad WebSocket max early data size: ${params.ed}`,
+                    );
+                }
+                if (httpupgrade) {
+                    opts['max-early-data'] = maxEarlyData;
+                } else if (proxy.network === 'ws') {
+                    opts['max-early-data'] = maxEarlyData;
+                    opts['early-data-header-name'] =
+                        params.eh || 'Sec-WebSocket-Protocol';
+                }
+            }
+            if (params.eh && (proxy.network === 'ws' || httpupgrade)) {
+                opts['early-data-header-name'] = params.eh;
             }
             if (Object.keys(opts).length > 0) {
                 proxy[`${proxy.network}-opts`] = opts;
@@ -829,12 +1712,55 @@ function URI_VLESS() {
                 // mKCP 的伪装头部类型。当前可选值有 none / srtp / utp / wechat-video / dtls / wireguard。省略时默认值为 none，即不使用伪装头部，但不可以为空字符串。
                 proxy.headerType = params.headerType || 'none';
             }
-
-            if (params.mode) {
-                proxy._mode = params.mode;
-            }
-            if (params.extra) {
+            if (params.extra && !['xhttp'].includes(proxy.network)) {
                 proxy._extra = params.extra;
+            }
+            if (['xhttp'].includes(proxy.network)) {
+                let extra = {};
+                let invalidRawExtra;
+                try {
+                    extra = params.extra ? JSON.parse(params.extra) : {};
+                } catch (e) {
+                    $.error(
+                        `Failed to parse extra field as JSON: ${params.extra}`,
+                    );
+                    invalidRawExtra = params.extra;
+                }
+                const xhttpOpts = {
+                    ...(proxy[`${proxy.network}-opts`] || {}),
+                };
+                if (params.mode) {
+                    xhttpOpts.mode = params.mode;
+                }
+                applyXhttpExtraFields(xhttpOpts, extra);
+                const downloadSettings = parseDownloadSettings(
+                    extra?.downloadSettings,
+                );
+                if (downloadSettings) {
+                    xhttpOpts['download-settings'] = downloadSettings;
+                }
+                if (Object.keys(xhttpOpts).length > 0) {
+                    proxy[`${proxy.network}-opts`] = xhttpOpts;
+                }
+                if (invalidRawExtra != null) {
+                    // Keep the raw invalid extra string so URI exports can
+                    // round-trip it verbatim even though Mihomo cannot model it.
+                    proxy._extra = invalidRawExtra;
+                }
+
+                // IMPORTANT: for VLESS xhttp we only keep URI extra fields that
+                // Mihomo does not model structurally in `_extra_unsupported`.
+                // Supported fields must round-trip through the structured node
+                // so later edits are reflected on export, while unsupported
+                // fields still survive VLESS URI -> node -> VLESS URI flows.
+                const unsupportedExtra = collectUnsupportedRootXhttpExtra(extra, {
+                    parsedDownloadSettings: downloadSettings,
+                });
+                if (unsupportedExtra) {
+                    proxy._extra_unsupported = unsupportedExtra;
+                }
+            } else if (params.mode) {
+                proxy._mode = params.mode;
             }
         }
         if (params.encryption) {
@@ -990,8 +1916,8 @@ function URI_Hysteria2() {
         proxy['tls-fingerprint'] = params.pinSHA256;
         let hop_interval = params['hop-interval'] || params['hop_interval'];
 
-        if (/^\d+$/.test(hop_interval)) {
-            proxy['hop-interval'] = parseInt(`${hop_interval}`, 10);
+        if (hop_interval != null) {
+            proxy['hop-interval'] = hop_interval;
         }
         let keepalive = params['keepalive'];
 
@@ -1172,7 +2098,16 @@ function URI_WireGuard() {
         };
         for (const addon of addons.split('&')) {
             if (addon) {
-                let [key, value] = addon.split('=');
+                const equalIndex = addon.indexOf('=');
+                let key;
+                let value;
+                if (equalIndex === -1) {
+                    key = addon;
+                    value = '';
+                } else {
+                    key = addon.slice(0, equalIndex);
+                    value = addon.slice(equalIndex + 1);
+                }
                 key = key.replace(/_/, '-');
                 value = decodeURIComponent(value);
                 if (['reserved'].includes(key)) {
@@ -1185,15 +2120,18 @@ function URI_WireGuard() {
                     }
                 } else if (['address', 'ip'].includes(key)) {
                     value.split(',').map((i) => {
-                        const ip = i
-                            .trim()
-                            .replace(/\/\d+$/, '')
-                            .replace(/^\[/, '')
-                            .replace(/\]$/, '');
-                        if (isIPv4(ip)) {
-                            proxy.ip = ip;
-                        } else if (isIPv6(ip)) {
-                            proxy.ipv6 = ip;
+                        const parsed = parseWireGuardURIAddressValue(i);
+                        if (!parsed) return;
+                        if (parsed.family === 'ipv4') {
+                            proxy.ip = parsed.address;
+                            if (typeof parsed.cidr !== 'undefined') {
+                                proxy['ip-cidr'] = parsed.cidr;
+                            }
+                        } else if (parsed.family === 'ipv6') {
+                            proxy.ipv6 = parsed.address;
+                            if (typeof parsed.cidr !== 'undefined') {
+                                proxy['ipv6-cidr'] = parsed.cidr;
+                            }
                         }
                     });
                 } else if (['mtu'].includes(key)) {
@@ -1266,6 +2204,7 @@ function Clash_All() {
         }
         if (
             ![
+                'tailscale',
                 'trusttunnel',
                 'naive',
                 'anytls',
@@ -1361,6 +2300,15 @@ function QX_VLESS() {
     const name = 'QX VLESS Parser';
     const test = (line) => {
         return /^vless\s*=/.test(line.split(',')[0].trim());
+    };
+    const parse = (line) => getQXParser().parse(line);
+    return { name, test, parse };
+}
+
+function QX_AnyTLS() {
+    const name = 'QX AnyTLS Parser';
+    const test = (line) => {
+        return /^anytls\s*=/.test(line.split(',')[0].trim());
     };
     const parse = (line) => getQXParser().parse(line);
     return { name, test, parse };
@@ -1656,10 +2604,16 @@ function Surge_Trojan() {
     return { name, test, parse };
 }
 
+const LOON_ONLY_OPTIONS =
+    /(^|,)\s*(fast-open|over-tls|tls-name|ip-mode|tls-cert-sha256|tls-pubkey-sha256)\s*=/i;
+
 function Surge_Http() {
     const name = 'Surge HTTP Parser';
     const test = (line) => {
-        return /^.*=\s*https?/.test(line.split(',')[0]);
+        return (
+            /^.*=\s*https?/.test(line.split(',')[0]) &&
+            !LOON_ONLY_OPTIONS.test(line)
+        );
     };
     const parse = (line) => getSurgeParser().parse(line);
     return { name, test, parse };
@@ -1668,7 +2622,10 @@ function Surge_Http() {
 function Surge_Socks5() {
     const name = 'Surge Socks5 Parser';
     const test = (line) => {
-        return /^.*=\s*socks5(-tls)?/.test(line.split(',')[0]);
+        return (
+            /^.*=\s*socks5(-tls)?/.test(line.split(',')[0]) &&
+            !LOON_ONLY_OPTIONS.test(line)
+        );
     };
     const parse = (line) => getSurgeParser().parse(line);
     return { name, test, parse };
@@ -1838,6 +2795,7 @@ export default [
     QX_SSR(),
     QX_VMess(),
     QX_VLESS(),
+    QX_AnyTLS(),
     QX_Trojan(),
     QX_Http(),
     QX_Socks5(),

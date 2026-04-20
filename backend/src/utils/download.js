@@ -22,6 +22,42 @@ const clashPreprocessor = PROXY_PREPROCESSORS.find(
 
 const tasks = new Map();
 
+function buildDownloadRegex(pattern = '') {
+    const trimmed = `${pattern}`.trim();
+    if (!trimmed) return null;
+    return new RegExp(trimmed, 'i');
+}
+
+function maybePrefixGithubProxyUrl(url, githubProxy, githubProxyRegex) {
+    if (!githubProxy || !githubProxyRegex || typeof url !== 'string') {
+        return url;
+    }
+
+    if (!/^https?:\/\//i.test(url)) {
+        return url;
+    }
+
+    const prefix = `${githubProxy}/`;
+    if (url.startsWith(prefix)) {
+        return url;
+    }
+
+    let regex;
+    try {
+        regex = buildDownloadRegex(githubProxyRegex);
+    } catch (e) {
+        $.error(`GitHub 加速代理匹配正则无效: ${e.message ?? e}`);
+        return url;
+    }
+
+    if (!regex?.test(url)) {
+        return url;
+    }
+
+    $.info(`GitHub 加速代理命中下载链接: ${url}`);
+    return `${githubProxy}/${url}`;
+}
+
 export default async function download(
     rawUrl = '',
     ua,
@@ -54,6 +90,8 @@ export default async function download(
     }
     const { isNode, isStash, isLoon, isShadowRocket, isQX } = ENV();
     const {
+        githubProxy,
+        githubProxyRegex,
         defaultProxy,
         defaultUserAgent,
         defaultTimeout,
@@ -64,7 +102,7 @@ export default async function download(
     if ($.env.isNode) {
         proxy = proxy || eval('process.env.SUB_STORE_BACKEND_DEFAULT_PROXY');
     }
-    const userAgent = ua || defaultUserAgent || 'clash.meta';
+    const userAgent = ua || defaultUserAgent || 'clash.meta/v1.19.23';
     let customHeaders;
     if ($arguments?.headers) {
         try {
@@ -87,6 +125,7 @@ export default async function download(
     }
 
     const requestTimeout = timeout || defaultTimeout || 8000;
+    url = maybePrefixGithubProxyUrl(url, githubProxy, githubProxyRegex);
     const id = hex_md5(
         `${customHeaders ? JSON.stringify(customHeaders) : userAgent}${url}`,
     );
@@ -265,7 +304,13 @@ export default async function download(
             if (headers) {
                 const flowInfo = getFlowField(headers);
                 if (flowInfo) {
-                    headersResourceCache.set(id, flowInfo);
+                    headersResourceCache.set(
+                        id,
+                        flowInfo,
+                        $arguments?.headersCacheTtl
+                            ? $arguments?.headersCacheTtl * 1000
+                            : undefined,
+                    );
                 }
             }
             if (body.replace(/\s/g, '').length === 0)
@@ -306,7 +351,14 @@ export default async function download(
                 }
             }
             if (shouldCache) {
-                resourceCache.set(id, body);
+                console.log($arguments);
+                resourceCache.set(
+                    id,
+                    body,
+                    $arguments?.cacheTtl
+                        ? $arguments?.cacheTtl * 1000
+                        : undefined,
+                );
                 if (customCacheKey) {
                     $.info(
                         `URL ${url}\n写入自定义缓存 ${$arguments?.cacheKey}`,

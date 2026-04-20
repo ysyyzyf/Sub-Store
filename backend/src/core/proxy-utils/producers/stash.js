@@ -1,4 +1,8 @@
-import { isPresent } from '@/core/proxy-utils/producers/utils';
+import {
+    isPresent,
+    produceProxyListOutput,
+    supportsShadowsocksV2rayPluginMode,
+} from '@/core/proxy-utils/producers/utils';
 import $ from '@/core/app';
 
 export default function Stash_Producer() {
@@ -7,6 +11,7 @@ export default function Stash_Producer() {
         // https://stash.wiki/proxy-protocols/proxy-types#shadowsocks
         const list = proxies
             .filter((proxy) => {
+                if (opts['include-unsupported-proxy']) return true;
                 if (
                     ![
                         'ss',
@@ -24,6 +29,7 @@ export default function Stash_Producer() {
                         'ssh',
                         'juicity',
                         'anytls',
+                        'tailscale',
                     ].includes(proxy.type) ||
                     (proxy.type === 'ss' &&
                         ![
@@ -44,10 +50,18 @@ export default function Stash_Producer() {
                             '2022-blake3-aes-128-gcm',
                             '2022-blake3-aes-256-gcm',
                         ].includes(proxy.cipher)) ||
-                    (proxy.type === 'snell' && proxy.version >= 4) ||
-                    (proxy.type === 'vless' &&
-                        proxy['reality-opts'] &&
-                        !['xtls-rprx-vision'].includes(proxy.flow))
+                    (proxy.type === 'snell' && proxy.version >= 4)
+                ) {
+                    return false;
+                } else if (
+                    !supportsShadowsocksV2rayPluginMode(proxy, ['websocket'])
+                ) {
+                    return false;
+                } else if (
+                    ['vless'].includes(proxy.type) &&
+                    proxy['reality-opts'] &&
+                    proxy.network &&
+                    !['tcp'].includes(proxy.network)
                 ) {
                     return false;
                 } else if (
@@ -276,9 +290,11 @@ export default function Stash_Producer() {
                         proxy[`${proxy.network}-opts`].path = '/';
                     }
                 }
+
                 if (proxy['plugin-opts']?.tls) {
                     if (isPresent(proxy, 'skip-cert-verify')) {
                         proxy['plugin-opts']['skip-cert-verify'] =
+                            proxy['plugin-opts']['skip-cert-verify'] ||
                             proxy['skip-cert-verify'];
                     }
                 }
@@ -324,6 +340,8 @@ export default function Stash_Producer() {
                 delete proxy.id;
                 delete proxy.resolved;
                 delete proxy['no-resolve'];
+                delete proxy['ip-cidr'];
+                delete proxy['ipv6-cidr'];
                 if (type !== 'internal') {
                     for (const key in proxy) {
                         if (proxy[key] == null || /^_/i.test(key)) {
@@ -340,12 +358,7 @@ export default function Stash_Producer() {
                 }
                 return proxy;
             });
-        return type === 'internal'
-            ? list
-            : 'proxies:\n' +
-                  list
-                      .map((proxy) => '  - ' + JSON.stringify(proxy) + '\n')
-                      .join('');
+        return produceProxyListOutput(list, type, opts);
     };
     return { type, produce };
 }

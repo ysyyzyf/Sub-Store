@@ -1,6 +1,7 @@
 import ClashMeta_Producer from './clashmeta';
 import $ from '@/core/app';
-import { isIPv4, isIPv6, isPlainObject } from '@/utils';
+import { isPlainObject } from '@/utils';
+import { getWireGuardAddressWithCIDR, normalizePluginMuxValue } from './utils';
 
 const ipVersions = {
     ipv4: 'ipv4_only',
@@ -19,6 +20,14 @@ const ipVersionParser = (proxy, parsedProxy) => {
         parsedProxy.domain_resolver = {
             server: proxy._dns_server,
             strategy,
+        };
+    }
+};
+const domainResolverParser = (proxy, parsedProxy) => {
+    if (proxy._domain_resolver) {
+        parsedProxy.domain_resolver = {
+            ...parsedProxy.domain_resolver,
+            ...proxy._domain_resolver,
         };
     }
 };
@@ -236,6 +245,30 @@ const grpcParser = (proxy, parsedProxy) => {
     parsedProxy.transport = transport;
 };
 
+const normalizePemLines = (value, label) => {
+    const items = Array.isArray(value) ? value : [value];
+    const lines = [];
+
+    for (const item of items) {
+        const normalized = `${item}`
+            .trim()
+            .replace(/\\r\\n/g, '\n')
+            .replace(/\\n/g, '\n');
+        if (normalized === '') continue;
+
+        for (const line of normalized.split(/\r?\n/)) {
+            const trimmed = line.trim();
+            if (trimmed !== '') lines.push(trimmed);
+        }
+    }
+
+    if (lines.length === 0) return undefined;
+    if (lines.some((line) => /^-----BEGIN [A-Za-z0-9 -]+-----$/.test(line))) {
+        return lines;
+    }
+    return [`-----BEGIN ${label}-----`, ...lines, `-----END ${label}-----`];
+};
+
 const tlsParser = (proxy, parsedProxy) => {
     if (proxy.tls) parsedProxy.tls.enabled = true;
     if (proxy.servername && proxy.servername !== '')
@@ -273,6 +306,22 @@ const tlsParser = (proxy, parsedProxy) => {
         };
     if (proxy._ech && isPlainObject(proxy._ech)) {
         parsedProxy.tls.ech = proxy._ech;
+    } else if (proxy['ech-opts'] && isPlainObject(proxy['ech-opts'])) {
+        parsedProxy.tls.ech = parsedProxy.tls.ech || {};
+        parsedProxy.tls.ech.enabled = proxy['ech-opts'].enable;
+        const echOptsConfig = proxy['ech-opts'].config;
+        if (Array.isArray(echOptsConfig) || typeof echOptsConfig === 'string') {
+            const config = normalizePemLines(echOptsConfig, 'ECH CONFIGS');
+            if (config) parsedProxy.tls.ech.config = config;
+        }
+        parsedProxy.tls.ech.query_server_name =
+            proxy['ech-opts']['query-server-name'];
+        parsedProxy.tls.ech.config_path = proxy['ech-opts']['config-path'];
+        parsedProxy.tls.ech.fragment = proxy['ech-opts']['fragment'];
+        parsedProxy.tls.ech.fragment_fallback_delay =
+            proxy['ech-opts']['fragment-fallback-delay'];
+        parsedProxy.tls.ech.record_fragment =
+            proxy['ech-opts']['record-fragment'];
     }
     if (proxy._curve_preferences && Array.isArray(proxy._curve_preferences)) {
         parsedProxy.tls.curve_preferences = proxy._curve_preferences;
@@ -335,6 +384,7 @@ const sshParser = (proxy = {}) => {
     tfoParser(proxy, parsedProxy);
     detourParser(proxy, parsedProxy);
     ipVersionParser(proxy, parsedProxy);
+    domainResolverParser(proxy, parsedProxy);
     return parsedProxy;
 };
 
@@ -363,6 +413,7 @@ const httpParser = (proxy = {}) => {
     detourParser(proxy, parsedProxy);
     tlsParser(proxy, parsedProxy);
     ipVersionParser(proxy, parsedProxy);
+    domainResolverParser(proxy, parsedProxy);
     return parsedProxy;
 };
 
@@ -394,6 +445,7 @@ const socks5Parser = (proxy = {}) => {
     tfoParser(proxy, parsedProxy);
     detourParser(proxy, parsedProxy);
     ipVersionParser(proxy, parsedProxy);
+    domainResolverParser(proxy, parsedProxy);
     return parsedProxy;
 };
 
@@ -439,6 +491,7 @@ const shadowTLSParser = (proxy = {}) => {
     detourParser(proxy, stPart);
     smuxParser(proxy.smux, ssPart);
     ipVersionParser(proxy, stPart);
+    domainResolverParser(proxy, stPart);
     return { type: 'ss-with-st', ssPart, stPart };
 };
 const ssParser = (proxy = {}) => {
@@ -469,6 +522,7 @@ const ssParser = (proxy = {}) => {
     detourParser(proxy, parsedProxy);
     smuxParser(proxy.smux, parsedProxy);
     ipVersionParser(proxy, parsedProxy);
+    domainResolverParser(proxy, parsedProxy);
     if (proxy.plugin) {
         const optArr = [];
         if (proxy.plugin === 'obfs') {
@@ -512,10 +566,14 @@ const ssParser = (proxy = {}) => {
                             )}`,
                         );
                         break;
-                    case 'mux':
-                        if (proxy['plugin-opts'].mux)
-                            parsedProxy.multiplex = { enabled: true };
+                    case 'mux': {
+                        const mux = normalizePluginMuxValue(
+                            proxy['plugin-opts'].mux,
+                        );
+                        if (mux) parsedProxy.multiplex = { enabled: true };
+                        optArr.push(`mux=${mux}`);
                         break;
+                    }
                     default:
                         optArr.push(`${k}=${proxy['plugin-opts'][k]}`);
                 }
@@ -548,6 +606,7 @@ const ssrParser = (proxy = {}) => {
     detourParser(proxy, parsedProxy);
     smuxParser(proxy.smux, parsedProxy);
     ipVersionParser(proxy, parsedProxy);
+    domainResolverParser(proxy, parsedProxy);
     return parsedProxy;
 };
 
@@ -587,6 +646,7 @@ const vmessParser = (proxy = {}) => {
     tlsParser(proxy, parsedProxy);
     smuxParser(proxy.smux, parsedProxy);
     ipVersionParser(proxy, parsedProxy);
+    domainResolverParser(proxy, parsedProxy);
     return parsedProxy;
 };
 
@@ -615,6 +675,7 @@ const vlessParser = (proxy = {}) => {
     smuxParser(proxy.smux, parsedProxy);
     tlsParser(proxy, parsedProxy);
     ipVersionParser(proxy, parsedProxy);
+    domainResolverParser(proxy, parsedProxy);
     return parsedProxy;
 };
 const trojanParser = (proxy = {}) => {
@@ -637,6 +698,7 @@ const trojanParser = (proxy = {}) => {
     tlsParser(proxy, parsedProxy);
     smuxParser(proxy.smux, parsedProxy);
     ipVersionParser(proxy, parsedProxy);
+    domainResolverParser(proxy, parsedProxy);
     return parsedProxy;
 };
 const naiveParser = (proxy = {}) => {
@@ -679,6 +741,7 @@ const naiveParser = (proxy = {}) => {
     tlsParser(proxy, parsedProxy);
     smuxParser(proxy.smux, parsedProxy);
     ipVersionParser(proxy, parsedProxy);
+    domainResolverParser(proxy, parsedProxy);
     if (parsedProxy.tls?.insecure) {
         $.info(
             `Platform sing-box: insecure is not supported on naive outbound`,
@@ -745,6 +808,7 @@ const hysteriaParser = (proxy = {}) => {
     tfoParser(proxy, parsedProxy);
     smuxParser(proxy.smux, parsedProxy);
     ipVersionParser(proxy, parsedProxy);
+    domainResolverParser(proxy, parsedProxy);
     return parsedProxy;
 };
 const hysteria2Parser = (proxy = {}) => {
@@ -780,6 +844,7 @@ const hysteria2Parser = (proxy = {}) => {
     detourParser(proxy, parsedProxy);
     smuxParser(proxy.smux, parsedProxy);
     ipVersionParser(proxy, parsedProxy);
+    domainResolverParser(proxy, parsedProxy);
     return parsedProxy;
 };
 const tuic5Parser = (proxy = {}) => {
@@ -812,6 +877,7 @@ const tuic5Parser = (proxy = {}) => {
     tlsParser(proxy, parsedProxy);
     smuxParser(proxy.smux, parsedProxy);
     ipVersionParser(proxy, parsedProxy);
+    domainResolverParser(proxy, parsedProxy);
     return parsedProxy;
 };
 const anytlsParser = (proxy = {}) => {
@@ -836,23 +902,62 @@ const anytlsParser = (proxy = {}) => {
     detourParser(proxy, parsedProxy);
     tlsParser(proxy, parsedProxy);
     ipVersionParser(proxy, parsedProxy);
+    domainResolverParser(proxy, parsedProxy);
+    return parsedProxy;
+};
+const tailscaleParser = (proxy = {}) => {
+    const parsedProxy = {
+        tag: proxy.name,
+        type: 'tailscale',
+        udp_timeout: proxy['udp-timeout'],
+        state_directory: proxy['state-directory'],
+        auth_key: proxy['auth-key'],
+        control_url: proxy['control-url'],
+        ephemeral: proxy.ephemeral,
+        hostname: proxy.hostname,
+        accept_routes: proxy['accept-routes'],
+        exit_node: proxy['exit-node'],
+        exit_node_allow_lan_access: proxy['exit-node-allow-lan-access'],
+        advertise_routes: Array.isArray(proxy['advertise-routes'])
+            ? proxy['advertise-routes']
+            : undefined,
+        advertise_exit_node: proxy['advertise-exit-node'],
+        advertise_tags: Array.isArray(proxy['advertise-tags'])
+            ? proxy['advertise-tags']
+            : undefined,
+        relay_server_static_endpoints: Array.isArray(
+            proxy['relay-server-static-endpoints'],
+        )
+            ? proxy['relay-server-static-endpoints']
+            : undefined,
+        system_interface: proxy['system-interface'],
+        system_interface_name: proxy['system-interface-name'],
+    };
+    if (/^\d+$/.test(proxy['system-interface-mtu']))
+        parsedProxy.system_interface_mtu = parseInt(
+            `${proxy['system-interface-mtu']}`,
+            10,
+        );
+    if (/^\d+$/.test(proxy['relay-server-port']))
+        parsedProxy.relay_server_port = parseInt(
+            `${proxy['relay-server-port']}`,
+            10,
+        );
+    networkParser(proxy, parsedProxy);
+    detourParser(proxy, parsedProxy);
+    ipVersionParser(proxy, parsedProxy);
+    domainResolverParser(proxy, parsedProxy);
     return parsedProxy;
 };
 
 const wireguardParser = (proxy = {}) => {
-    const address = ['ip', 'ipv6']
-        .map((i) => proxy[i])
-        .map((i) => {
-            if (isIPv4(i)) return `${i}/32`;
-            if (isIPv6(i)) return `${i}/128`;
-        })
+    const address = ['ipv4', 'ipv6']
+        .map((family) => getWireGuardAddressWithCIDR(proxy, family))
         .filter((i) => i);
     const parsedProxy = {
         system: !!proxy.system,
         mtu: proxy.mtu ? parseInt(`${proxy.mtu}`, 10) : undefined,
-        udp_timeout: proxy['udp-timeout']
-            ? parseInt(`${proxy['udp-timeout']}`, 10)
-            : undefined,
+        udp_timeout: proxy['udp-timeout'],
         workers: proxy['workers']
             ? parseInt(`${proxy['workers']}`, 10)
             : undefined,
@@ -933,6 +1038,7 @@ const wireguardParser = (proxy = {}) => {
     detourParser(proxy, parsedProxy);
     smuxParser(proxy.smux, parsedProxy);
     ipVersionParser(proxy, parsedProxy);
+    domainResolverParser(proxy, parsedProxy);
     delete parsedProxy.server;
     delete parsedProxy.server_port;
     delete parsedProxy.pre_shared_key;
@@ -949,6 +1055,10 @@ export default function singbox_Producer() {
             .produce(proxies, 'internal', { 'include-unsupported-proxy': true })
             .map((proxy) => {
                 try {
+                    if (['xhttp'].includes(proxy.network))
+                        throw new Error(
+                            `Platform sing-box does not support network: ${proxy.network}`,
+                        );
                     switch (proxy.type) {
                         case 'ssh':
                             list.push(sshParser(proxy));
@@ -1085,6 +1195,9 @@ export default function singbox_Producer() {
                         case 'anytls':
                             list.push(anytlsParser(proxy));
                             break;
+                        case 'tailscale':
+                            list.push(tailscaleParser(proxy));
+                            break;
                         default:
                             throw new Error(
                                 `Platform sing-box does not support proxy type: ${proxy.type}`,
@@ -1100,7 +1213,7 @@ export default function singbox_Producer() {
 
         const categorized = list.reduce(
             (result, item) => {
-                if (['wireguard'].includes(item.type)) {
+                if (['wireguard', 'tailscale'].includes(item.type)) {
                     result.endpoints.push(item);
                 } else {
                     result.outbounds.push(item);

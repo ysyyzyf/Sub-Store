@@ -23,9 +23,14 @@ import { findByName } from '@/utils/database';
 import { produceArtifact } from '@/restful/sync';
 import { getFlag, removeFlag, getISO, MMDB } from '@/utils/geo';
 import Gist from '@/utils/gist';
-import { isPresent } from './producers/utils';
+import {
+    isPresent,
+    isShadowsocksOverTls,
+    normalizeWireGuardInterface,
+} from './producers/utils';
 import { doh } from '@/utils/dns';
 import JSON5 from 'json5';
+import { hex_md5 } from '@/vendor/md5';
 
 function preprocess(raw) {
     for (const processor of PROXY_PREPROCESSORS) {
@@ -87,6 +92,13 @@ function parse(raw) {
                 $.info(`UUID may be invalid: ${proxy.name} ${proxy.uuid}`);
             }
             // return isProxyUUIDValid;
+        } else if (['hysteria2'].includes(proxy.type)) {
+            if (proxy.obfs && !proxy['obfs-password']) {
+                $.error(
+                    `Proxy ${proxy.name} has obfs ${proxy.obfs} but missing obfs-password`,
+                );
+                return false;
+            }
         }
         return true;
     });
@@ -136,7 +148,6 @@ async function processFn(
                         }
                     }
                 }
-                console.log(rawArgs);
                 url = `${url.split('#')[0]}${
                     rawArgs[2]
                         ? `#${rawArgs[2]}`
@@ -240,6 +251,13 @@ function produce(proxies, targetPlatform, type, opts = {}) {
         throw new Error(`Target platform: ${targetPlatform} is not supported!`);
     }
 
+    const normalizedTarget = String(targetPlatform).toLowerCase();
+    const supportedShadowsocksOverTlsTargets = new Set([
+        'qx',
+        'quantumultx',
+        'shadowrocket',
+    ]);
+
     const sni_off_supported = /Surge|SurgeMac|Shadowrocket/i.test(
         targetPlatform,
     );
@@ -251,12 +269,61 @@ function produce(proxies, targetPlatform, type, opts = {}) {
             return false;
         }
 
+        if (
+            isShadowsocksOverTls(proxy) &&
+            !supportedShadowsocksOverTlsTargets.has(normalizedTarget) &&
+            !opts['include-unsupported-proxy']
+        ) {
+            return false;
+        }
+
         // 对于 vless 和 vmess 代理,需要额外验证 UUID
         if (['vless', 'vmess'].includes(proxy.type)) {
             const isProxyUUIDValid = isValidUUID(proxy.uuid);
             if (!isProxyUUIDValid)
                 $.info(`UUID may be invalid: ${proxy.name} ${proxy.uuid}`);
             // return isProxyUUIDValid;
+            const isVlessType = proxy.type === 'vless';
+            const realityChecks = isVlessType
+                ? [
+                      ['reality-opts', proxy['reality-opts']],
+                      [
+                          'xhttp download-settings reality-opts',
+                          proxy['xhttp-opts']?.['download-settings']?.[
+                              'reality-opts'
+                          ],
+                      ],
+                  ]
+                : [];
+            for (const [realityLabel, realityOpts] of realityChecks) {
+                if (realityOpts && !isNotBlank(realityOpts['public-key'])) {
+                    // Intentional: a VLESS Reality node without public-key is
+                    // not a valid Mihomo export or regenerated share link. We
+                    // keep the marker while parsing so callers can inspect the
+                    // broken config, then stop export here instead of silently
+                    // emitting invalid Reality output.
+                    $.error(
+                        `Skipping VLESS Reality proxy ${proxy.name}: empty ${realityLabel}.public-key`,
+                    );
+                    return false;
+                }
+            }
+
+            const xhttpOpts = proxy['xhttp-opts'];
+            if (
+                isVlessType &&
+                proxy.network === 'xhttp' &&
+                xhttpOpts?.mode === 'stream-one' &&
+                xhttpOpts['download-settings']
+            ) {
+                // Match Mihomo's outbound validation: xhttp download-settings
+                // require split transports, so stream-one is rejected instead
+                // of emitting a config/share link that Mihomo will not accept.
+                $.error(
+                    `Skipping VLESS xhttp proxy ${proxy.name}: mode "stream-one" cannot be used with download-settings`,
+                );
+                return false;
+            }
         }
 
         return true;
@@ -290,6 +357,9 @@ function produce(proxies, targetPlatform, type, opts = {}) {
             if (!proxy.port) {
                 proxy.port = getRandomPort(proxy.ports);
             }
+        }
+        if (proxy.type === 'wireguard') {
+            normalizeWireGuardInterface(proxy);
         }
 
         return proxy;
@@ -352,6 +422,7 @@ export const ProxyUtils = {
     Buffer,
     Base64,
     JSON5,
+    hex_md5,
 };
 
 function tryParse(parser, line) {
@@ -391,6 +462,38 @@ function lastParse(proxy) {
     }
     if (typeof proxy.password === 'number') {
         proxy.password = numberToString(proxy.password);
+    }
+    if (proxy['hop-interval'] != null) {
+        const hopInterval = `${proxy['hop-interval']}`.trim();
+        const hopIntervalRangeMatch = hopInterval.match(/^(\d+)\s*-\s*(\d+)$/);
+
+        if (hopIntervalRangeMatch) {
+            const hopIntervalMin = parseInt(hopIntervalRangeMatch[1], 10);
+            const hopIntervalMax = parseInt(hopIntervalRangeMatch[2], 10);
+
+            if (hopIntervalMin > 0 && hopIntervalMin <= hopIntervalMax) {
+                // 暂时只在统一收口阶段拆分 mihomo 的 hop-interval 区间写法，
+                // 不对其他客户端做进一步转换，等 mihomo / sing-box 新版覆盖率上来后再统一处理。
+                proxy['hop-interval'] = hopIntervalMin;
+                proxy['hop-interval-max'] = hopIntervalMax;
+            } else {
+                delete proxy['hop-interval'];
+                delete proxy['hop-interval-max'];
+            }
+        } else if (/^\d+$/.test(hopInterval)) {
+            const parsedHopInterval = parseInt(hopInterval, 10);
+
+            if (parsedHopInterval > 0) {
+                proxy['hop-interval'] = parsedHopInterval;
+                delete proxy['hop-interval-max'];
+            } else {
+                delete proxy['hop-interval'];
+                delete proxy['hop-interval-max'];
+            }
+        } else {
+            delete proxy['hop-interval'];
+            delete proxy['hop-interval-max'];
+        }
     }
     if (
         ['ss'].includes(proxy.type) &&
@@ -522,11 +625,12 @@ function lastParse(proxy) {
             proxy[`${proxy.network}-opts`].path = [transportPath];
         }
     }
-    if (proxy.tls && !proxy.sni) {
-        if (!isIP(proxy.server)) {
-            proxy.sni = proxy.server;
-        }
-        if (!proxy.sni && proxy.network) {
+    // 允许设置 sni 为空字符串且为防止影响其他逻辑, 这里先改成这样判断
+    // 本质上是为了防止本来应该使用 server 作为 sni 的情况下, 若之后进行了域名解析, 导致 server 变成 ip 丢失了 sni
+    // 为了兼容性, 暂时先这么改
+    if (proxy.tls && !proxy.sni && proxy.sni !== '') {
+        // 传输层若有设置就使用
+        if (proxy.network) {
             let transportHost = proxy[`${proxy.network}-opts`]?.headers?.Host;
             transportHost = Array.isArray(transportHost)
                 ? transportHost[0]
@@ -534,6 +638,10 @@ function lastParse(proxy) {
             if (transportHost) {
                 proxy.sni = transportHost;
             }
+        }
+        // 不区分是不是域名, 总之如果到这里还没 sni, 可以设置域名 server 为 sni
+        if (!proxy.sni && !isIP(proxy.server)) {
+            proxy.sni = proxy.server;
         }
     }
     // if (['hysteria', 'hysteria2', 'tuic'].includes(proxy.type)) {
@@ -685,18 +793,7 @@ function lastParse(proxy) {
                 }
             }
         }
-        if (proxy.ip?.includes('/')) {
-            const [ip] = proxy.ip.split('/');
-            if (isIPv4(ip)) {
-                proxy.ip = ip;
-            }
-        }
-        if (proxy.ipv6?.includes('/')) {
-            const [ip] = proxy.ipv6.split('/');
-            if (isIPv6(ip)) {
-                proxy.ipv6 = ip;
-            }
-        }
+        normalizeWireGuardInterface(proxy);
     }
     return proxy;
 }

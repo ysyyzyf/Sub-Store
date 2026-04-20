@@ -1,6 +1,433 @@
 /* eslint-disable no-case-declarations */
 import { Base64 } from 'js-base64';
-import { isIPv6 } from '@/utils';
+import { isIPv6, isPlainObject } from '@/utils';
+import { getWireGuardAddressWithCIDR, normalizePluginMuxValue } from './utils';
+import {
+    normalizeXhttpIntegerValue,
+    normalizeXhttpNonNegativeRange,
+    normalizeXhttpPositiveRange,
+    normalizeXhttpScalarUpperBound,
+} from '../xhttp-utils';
+
+function toStringHeaderMap(headers, { excludeHost = false } = {}) {
+    if (!isPlainObject(headers)) {
+        return undefined;
+    }
+
+    const parsedHeaders = {};
+    for (const [key, value] of Object.entries(headers)) {
+        if (typeof value !== 'string' || value === '') {
+            continue;
+        }
+        if (excludeHost && /^host$/i.test(key)) {
+            continue;
+        }
+        parsedHeaders[key] = value;
+    }
+
+    return Object.keys(parsedHeaders).length > 0 ? parsedHeaders : undefined;
+}
+
+function parseIntegerLikeValue(value) {
+    return normalizeXhttpIntegerValue(value);
+}
+
+function getSerializableXhttpRangeValue(value) {
+    return normalizeXhttpNonNegativeRange(value);
+}
+
+function getTransportHost(network, transportOpts = {}) {
+    if (network === 'h2') {
+        return (
+            transportOpts.host ??
+            transportOpts.headers?.host ??
+            transportOpts.headers?.Host
+        );
+    }
+    if (network === 'xhttp') {
+        return (
+            transportOpts.host ??
+            transportOpts.headers?.Host ??
+            transportOpts.headers?.host
+        );
+    }
+    return (
+        transportOpts.headers?.Host ??
+        transportOpts.headers?.host ??
+        transportOpts.host
+    );
+}
+
+function mapReuseSettingsToXmux(reuseSettings) {
+    if (!isPlainObject(reuseSettings)) {
+        return undefined;
+    }
+
+    const xmux = {};
+    const reuseFieldMap = {
+        'max-connections': 'maxConnections',
+        'max-concurrency': 'maxConcurrency',
+        'c-max-reuse-times': 'cMaxReuseTimes',
+        'h-max-request-times': 'hMaxRequestTimes',
+        'h-max-reusable-secs': 'hMaxReusableSecs',
+    };
+
+    for (const [sourceKey, targetKey] of Object.entries(reuseFieldMap)) {
+        const normalizedValue = normalizeXhttpNonNegativeRange(
+            reuseSettings[sourceKey],
+        );
+        if (normalizedValue != null) {
+            xmux[targetKey] =
+                typeof normalizedValue === 'number'
+                    ? `${normalizedValue}`
+                    : normalizedValue;
+        }
+    }
+
+    const hKeepAlivePeriod = parseIntegerLikeValue(
+        reuseSettings['h-keep-alive-period'],
+    );
+    if (hKeepAlivePeriod != null) {
+        xmux.hKeepAlivePeriod = hKeepAlivePeriod;
+    }
+
+    return Object.keys(xmux).length > 0 ? xmux : undefined;
+}
+
+function applyStructuredXhttpExtraFields(
+    target,
+    xhttpOpts,
+    { excludeHostHeader = true, xmuxTarget = 'root' } = {},
+) {
+    if (!isPlainObject(target) || !isPlainObject(xhttpOpts)) {
+        return;
+    }
+
+    const headers = toStringHeaderMap(xhttpOpts.headers, {
+        excludeHost: excludeHostHeader,
+    });
+    if (headers) {
+        target.headers = headers;
+    }
+
+    if (xhttpOpts['no-grpc-header'] === true) {
+        target.noGRPCHeader = true;
+    }
+    if (xhttpOpts['x-padding-bytes']) {
+        target.xPaddingBytes = xhttpOpts['x-padding-bytes'];
+    }
+    if (xhttpOpts['x-padding-obfs-mode'] === true) {
+        target.xPaddingObfsMode = true;
+    }
+    if (xhttpOpts['x-padding-key']) {
+        target.xPaddingKey = xhttpOpts['x-padding-key'];
+    }
+    if (xhttpOpts['x-padding-header']) {
+        target.xPaddingHeader = xhttpOpts['x-padding-header'];
+    }
+    if (xhttpOpts['x-padding-placement']) {
+        target.xPaddingPlacement = xhttpOpts['x-padding-placement'];
+    }
+    if (xhttpOpts['x-padding-method']) {
+        target.xPaddingMethod = xhttpOpts['x-padding-method'];
+    }
+    if (xhttpOpts['uplink-http-method']) {
+        target.uplinkHTTPMethod = xhttpOpts['uplink-http-method'];
+    }
+    if (xhttpOpts['session-placement']) {
+        target.sessionPlacement = xhttpOpts['session-placement'];
+    }
+    if (xhttpOpts['session-key']) {
+        target.sessionKey = xhttpOpts['session-key'];
+    }
+    if (xhttpOpts['seq-placement']) {
+        target.seqPlacement = xhttpOpts['seq-placement'];
+    }
+    if (xhttpOpts['seq-key']) {
+        target.seqKey = xhttpOpts['seq-key'];
+    }
+    if (xhttpOpts['uplink-data-placement']) {
+        target.uplinkDataPlacement = xhttpOpts['uplink-data-placement'];
+    }
+    if (xhttpOpts['uplink-data-key']) {
+        target.uplinkDataKey = xhttpOpts['uplink-data-key'];
+    }
+
+    const uplinkChunkSize = getSerializableXhttpRangeValue(
+        xhttpOpts['uplink-chunk-size'],
+    );
+    if (uplinkChunkSize != null) {
+        target.uplinkChunkSize = uplinkChunkSize;
+    }
+
+    if (xhttpOpts['sc-max-each-post-bytes'] != null) {
+        const scMaxEachPostBytes = normalizeXhttpScalarUpperBound(
+            xhttpOpts['sc-max-each-post-bytes'],
+        );
+        if (scMaxEachPostBytes != null) {
+            target.scMaxEachPostBytes = scMaxEachPostBytes;
+        }
+    }
+
+    if (xhttpOpts['sc-min-posts-interval-ms'] != null) {
+        const scMinPostsIntervalMs = normalizeXhttpPositiveRange(
+            xhttpOpts['sc-min-posts-interval-ms'],
+        );
+        if (scMinPostsIntervalMs != null) {
+            target.scMinPostsIntervalMs = scMinPostsIntervalMs;
+        }
+    }
+
+    const xmux = mapReuseSettingsToXmux(xhttpOpts['reuse-settings']);
+    if (xmux) {
+        if (xmuxTarget === 'extra') {
+            target.extra = {
+                ...(isPlainObject(target.extra) ? target.extra : {}),
+                xmux,
+            };
+        } else {
+            target.xmux = xmux;
+        }
+    }
+}
+
+function buildXhttpDownloadSettings(downloadSettings) {
+    if (!isPlainObject(downloadSettings)) {
+        return undefined;
+    }
+
+    const explicitNetwork =
+        typeof downloadSettings.network === 'string'
+            ? downloadSettings.network.toLowerCase()
+            : '';
+    const normalizedNetwork =
+        explicitNetwork === 'xhttp' || explicitNetwork === 'splithttp'
+            ? 'xhttp'
+            : undefined;
+
+    const result = {};
+    if (downloadSettings.server) {
+        result.address = downloadSettings.server;
+    }
+    const parsedPort = normalizeXhttpIntegerValue(downloadSettings.port, {
+        allowNegative: false,
+    });
+    if (parsedPort != null) {
+        result.port = parsedPort;
+    }
+
+    const realityOpts = isPlainObject(downloadSettings['reality-opts'])
+        ? downloadSettings['reality-opts']
+        : undefined;
+    if (realityOpts) {
+        result.security = 'reality';
+    } else if (downloadSettings.tls) {
+        result.security = 'tls';
+    }
+
+    const tlsSettings = {};
+    if (downloadSettings.servername) {
+        tlsSettings.serverName = downloadSettings.servername;
+    }
+    if (downloadSettings['client-fingerprint']) {
+        tlsSettings.fingerprint = downloadSettings['client-fingerprint'];
+    }
+    if (downloadSettings['skip-cert-verify']) {
+        tlsSettings.allowInsecure = true;
+    }
+    if (downloadSettings.alpn) {
+        tlsSettings.alpn = Array.isArray(downloadSettings.alpn)
+            ? downloadSettings.alpn
+            : [downloadSettings.alpn];
+    }
+    if (
+        isPlainObject(downloadSettings['ech-opts']) &&
+        downloadSettings['ech-opts'].config
+    ) {
+        tlsSettings.echConfigList = downloadSettings['ech-opts'].config;
+    }
+    if (Object.keys(tlsSettings).length > 0) {
+        result.tlsSettings = tlsSettings;
+    }
+
+    if (realityOpts) {
+        const realitySettings = {};
+        if (downloadSettings.servername) {
+            realitySettings.serverName = downloadSettings.servername;
+        }
+        if (downloadSettings['client-fingerprint']) {
+            realitySettings.fingerprint =
+                downloadSettings['client-fingerprint'];
+        }
+        if (realityOpts['public-key']) {
+            realitySettings.publicKey = realityOpts['public-key'];
+        }
+        if (realityOpts['short-id']) {
+            realitySettings.shortId = realityOpts['short-id'];
+        }
+        if (Object.keys(realitySettings).length > 0) {
+            result.realitySettings = realitySettings;
+        }
+    }
+
+    const xhttpSettings = {};
+    if (downloadSettings.path) {
+        xhttpSettings.path = downloadSettings.path;
+    }
+    const downloadHost = getTransportHost('xhttp', downloadSettings);
+    if (downloadHost) {
+        xhttpSettings.host = downloadHost;
+    }
+    applyStructuredXhttpExtraFields(xhttpSettings, downloadSettings, {
+        excludeHostHeader: true,
+        xmuxTarget: 'extra',
+    });
+    if (Object.keys(xhttpSettings).length > 0) {
+        result.xhttpSettings = xhttpSettings;
+    }
+
+    if (Object.keys(result).length === 0 && normalizedNetwork == null) {
+        return undefined;
+    }
+
+    // Treat nested downloadSettings.network as a supported structured field.
+    // Fresh structured exports still default to xhttp so Xray sees a nested
+    // StreamConfig instead of falling back to tcp.
+    return {
+        ...(result.address != null ? { address: result.address } : {}),
+        network: normalizedNetwork || 'xhttp',
+        ...(result.port != null ? { port: result.port } : {}),
+        ...(result.security != null ? { security: result.security } : {}),
+        ...(result.tlsSettings != null ? { tlsSettings: result.tlsSettings } : {}),
+        ...(result.realitySettings != null
+            ? { realitySettings: result.realitySettings }
+            : {}),
+        ...(result.xhttpSettings != null ? { xhttpSettings: result.xhttpSettings } : {}),
+    };
+}
+
+function buildStructuredVlessExtraObject(proxy) {
+    const xhttpOpts = proxy['xhttp-opts'] || {};
+    const extra = {};
+    applyStructuredXhttpExtraFields(extra, xhttpOpts, {
+        excludeHostHeader: true,
+        xmuxTarget: 'root',
+    });
+
+    const downloadSettings = buildXhttpDownloadSettings(
+        xhttpOpts['download-settings'],
+    );
+    if (downloadSettings) {
+        extra.downloadSettings = downloadSettings;
+    }
+
+    return Object.keys(extra).length > 0 ? extra : undefined;
+}
+
+function cloneXhttpExtraValue(value) {
+    if (Array.isArray(value)) {
+        return value.map(cloneXhttpExtraValue);
+    }
+
+    if (isPlainObject(value)) {
+        const clonedValue = {};
+        for (const [key, entryValue] of Object.entries(value)) {
+            clonedValue[key] = cloneXhttpExtraValue(entryValue);
+        }
+        return clonedValue;
+    }
+
+    return value;
+}
+
+function mergeUnsupportedXhttpExtraValue(baseValue, unsupportedValue) {
+    if (baseValue == null) {
+        return cloneXhttpExtraValue(unsupportedValue);
+    }
+
+    if (Array.isArray(baseValue) || Array.isArray(unsupportedValue)) {
+        return cloneXhttpExtraValue(baseValue);
+    }
+
+    if (isPlainObject(baseValue) && isPlainObject(unsupportedValue)) {
+        return mergeUnsupportedXhttpExtraObject(baseValue, unsupportedValue);
+    }
+
+    return cloneXhttpExtraValue(baseValue);
+}
+
+function mergeUnsupportedXhttpExtraObject(baseObject, unsupportedObject) {
+    const mergedExtra = isPlainObject(baseObject)
+        ? cloneXhttpExtraValue(baseObject)
+        : {};
+    if (!isPlainObject(unsupportedObject)) {
+        return mergedExtra;
+    }
+
+    for (const [key, value] of Object.entries(unsupportedObject)) {
+        if (!Object.prototype.hasOwnProperty.call(mergedExtra, key)) {
+            mergedExtra[key] = cloneXhttpExtraValue(value);
+            continue;
+        }
+
+        mergedExtra[key] = mergeUnsupportedXhttpExtraValue(
+            mergedExtra[key],
+            value,
+        );
+    }
+
+    return mergedExtra;
+}
+
+function getExplicitExtraOverride(proxy) {
+    if (typeof proxy._extra === 'string') {
+        return proxy._extra;
+    }
+
+    // `_extra` only accepts JSON-like plain objects here. Broader object checks
+    // would accidentally stringify instances such as Date/Map/class values.
+    if (isPlainObject(proxy._extra)) {
+        return JSON.stringify(proxy._extra);
+    }
+
+    return undefined;
+}
+
+function buildVlessExtra(proxy) {
+    const explicitExtraOverride = getExplicitExtraOverride(proxy);
+    if (explicitExtraOverride != null) {
+        // `_extra` is an explicit user override for the final URI extra. When
+        // present as a string or plain object, we bypass the structured xhttp
+        // rebuild entirely so users can hand-author extra without needing to
+        // keep other structured fields in sync.
+        return explicitExtraOverride;
+    }
+
+    if (proxy.network !== 'xhttp') {
+        return proxy._extra || '';
+    }
+
+    const structuredExtra = buildStructuredVlessExtraObject(proxy);
+
+    // IMPORTANT: `_extra_unsupported` is only the sidecar for URI extra fields
+    // that Mihomo does not model structurally yet, and it only participates
+    // when the user did not explicitly set `_extra`. Without an explicit
+    // override, supported xhttp fields must still be emitted from the current
+    // structured Mihomo node so later edits are reflected on export, while
+    // `_extra_unsupported` fills the holes needed for VLESS URI -> node ->
+    // VLESS URI lossless round-trips. That also means supported-field format
+    // conflicts are resolved by the structured emitters here, e.g.
+    // sc-max-each-post-bytes still emits the compatibility upper bound while
+    // sc-min-posts-interval-ms keeps range.
+    const mergedExtra = mergeUnsupportedXhttpExtraObject(
+        structuredExtra,
+        proxy._extra_unsupported,
+    );
+
+    return Object.keys(mergedExtra).length > 0
+        ? JSON.stringify(mergedExtra)
+        : '';
+}
 
 function vless(proxy) {
     let security = 'none';
@@ -40,8 +467,8 @@ function vless(proxy) {
         h2 = `&h2=1`;
     }
     let pcs = '';
-    if (proxy._pcs) {
-        pcs = `&pcs=${encodeURIComponent(proxy._pcs)}`;
+    if (proxy['tls-fingerprint']) {
+        pcs = `&pcs=${encodeURIComponent(proxy['tls-fingerprint'])}`;
     }
     let ech = '';
     if (proxy._echConfigList) {
@@ -60,11 +487,19 @@ function vless(proxy) {
         flow = `&flow=${encodeURIComponent(proxy.flow)}`;
     }
     let extra = '';
-    if (proxy._extra) {
-        extra = `&extra=${encodeURIComponent(proxy._extra)}`;
+    const extraPayload = buildVlessExtra(proxy);
+    if (extraPayload) {
+        extra = `&extra=${encodeURIComponent(extraPayload)}`;
     }
     let mode = '';
-    if (proxy._mode) {
+    if (
+        ['xhttp'].includes(proxy.network) &&
+        proxy[`${proxy.network}-opts`]?.mode
+    ) {
+        mode = `&mode=${encodeURIComponent(
+            proxy[`${proxy.network}-opts`].mode,
+        )}`;
+    } else if (proxy._mode) {
         mode = `&mode=${encodeURIComponent(proxy._mode)}`;
     }
     let pqv = '';
@@ -78,9 +513,16 @@ function vless(proxy) {
     let vlessType = proxy.network;
     if (proxy.network === 'ws' && proxy['ws-opts']?.['v2ray-http-upgrade']) {
         vlessType = 'httpupgrade';
+    } else if (proxy.network === 'http') {
+        vlessType = 'tcp';
+    } else if (proxy.network === 'h2') {
+        vlessType = 'http';
     }
 
     let vlessTransport = `&type=${encodeURIComponent(vlessType)}`;
+    if (proxy.network === 'http') {
+        vlessTransport += '&headerType=http';
+    }
     if (['grpc'].includes(proxy.network)) {
         // https://github.com/XTLS/Xray-core/issues/91
         vlessTransport += `&mode=${encodeURIComponent(
@@ -92,10 +534,11 @@ function vless(proxy) {
         }
     }
 
+    const transportOpts = proxy[`${proxy.network}-opts`] || {};
     let vlessTransportServiceName =
-        proxy[`${proxy.network}-opts`]?.[`${proxy.network}-service-name`];
-    let vlessTransportPath = proxy[`${proxy.network}-opts`]?.path;
-    let vlessTransportHost = proxy[`${proxy.network}-opts`]?.headers?.Host;
+        transportOpts?.[`${proxy.network}-service-name`];
+    let vlessTransportPath = transportOpts?.path;
+    let vlessTransportHost = getTransportHost(proxy.network, transportOpts);
     if (vlessTransportPath) {
         vlessTransport += `&path=${encodeURIComponent(
             Array.isArray(vlessTransportPath)
@@ -115,6 +558,11 @@ function vless(proxy) {
             vlessTransportServiceName,
         )}`;
     }
+    if (proxy.network === 'http' && proxy['http-opts']?.method) {
+        vlessTransport += `&method=${encodeURIComponent(
+            proxy['http-opts'].method,
+        )}`;
+    }
     if (proxy.network === 'kcp') {
         if (proxy.seed) {
             vlessTransport += `&seed=${encodeURIComponent(proxy.seed)}`;
@@ -125,12 +573,46 @@ function vless(proxy) {
             )}`;
         }
     }
+    if (
+        proxy.network === 'ws' &&
+        !proxy['ws-opts']?.['v2ray-http-upgrade'] &&
+        proxy['ws-opts']?.['max-early-data'] != null
+    ) {
+        vlessTransport += `&ed=${encodeURIComponent(
+            proxy['ws-opts']['max-early-data'],
+        )}`;
+    }
+    if (
+        proxy.network === 'ws' &&
+        proxy['ws-opts']?.['v2ray-http-upgrade'] &&
+        proxy['ws-opts']?.['max-early-data'] != null
+    ) {
+        vlessTransport += `&ed=${encodeURIComponent(
+            proxy['ws-opts']['max-early-data'],
+        )}`;
+    }
+    const earlyDataHeaderName = proxy['ws-opts']?.['early-data-header-name'];
+    if (
+        earlyDataHeaderName &&
+        (proxy['ws-opts']?.['v2ray-http-upgrade'] ||
+            proxy['ws-opts']?.['max-early-data'] == null ||
+            earlyDataHeaderName !== 'Sec-WebSocket-Protocol')
+    ) {
+        vlessTransport += `&eh=${encodeURIComponent(earlyDataHeaderName)}`;
+    }
+
+    let packetEncoding = '';
+    if (proxy['packet-addr']) {
+        packetEncoding = '&packetEncoding=packet';
+    } else if (proxy.udp === true && !proxy.xudp) {
+        packetEncoding = '&packetEncoding=none';
+    }
 
     return `vless://${proxy.uuid}@${proxy.server}:${
         proxy.port
     }?security=${encodeURIComponent(
         security,
-    )}${vlessTransport}${alpn}${allowInsecure}${pcs}${ech}${h2}${sni}${fp}${flow}${sid}${spx}${pbk}${mode}${extra}${pqv}${encryption}#${encodeURIComponent(
+    )}${vlessTransport}${packetEncoding}${alpn}${allowInsecure}${pcs}${ech}${h2}${sni}${fp}${flow}${sid}${spx}${pbk}${mode}${extra}${pqv}${encryption}#${encodeURIComponent(
         proxy.name,
     )}`;
 }
@@ -197,12 +679,21 @@ export default function URI_Producer() {
                             );
                             break;
                         case 'v2ray-plugin':
+                            const mux = normalizePluginMuxValue(opts.mux);
+                            // 为了兼容性 多输出 mode 和 host 两个字段
                             query += encodeURIComponent(
-                                `v2ray-plugin;obfs=${opts.mode}${
-                                    opts.host ? ';obfs-host=' + opts.host : ''
-                                }${opts.host ? ';host=' + opts.host : ''}${
-                                    opts.path ? ';path=' + opts.path : ''
-                                }${opts.tls ? ';tls' : ''}`,
+                                `v2ray-plugin;obfs=${opts.mode};mode=${
+                                    opts.mode
+                                }${opts.host ? ';obfs-host=' + opts.host : ''}${
+                                    opts.host ? ';host=' + opts.host : ''
+                                }${opts.path ? ';path=' + opts.path : ''}${
+                                    opts.tls ? ';tls' : ''
+                                }${opts.sni ? ';sni=' + opts.sni : ''}${
+                                    opts['skip-cert-verify']
+                                        ? ';skip-cert-verify=' +
+                                          opts['skip-cert-verify']
+                                        : ''
+                                }${mux != null ? ';mux=' + mux : ''}`,
                             );
                             break;
                         case 'shadow-tls':
@@ -480,6 +971,12 @@ export default function URI_Producer() {
                         proxy['client-fingerprint'],
                     )}`;
                 }
+                let trojanPcs = '';
+                if (proxy['tls-fingerprint']) {
+                    trojanPcs = `&pcs=${encodeURIComponent(
+                        proxy['tls-fingerprint'],
+                    )}`;
+                }
                 let trojanAlpn = '';
                 if (proxy.alpn) {
                     trojanAlpn = `&alpn=${encodeURIComponent(
@@ -522,7 +1019,7 @@ export default function URI_Producer() {
                     proxy.port
                 }?sni=${encodeURIComponent(proxy.sni || proxy.server)}${
                     proxy['skip-cert-verify'] ? '&allowInsecure=1' : ''
-                }${trojanTransport}${trojanAlpn}${trojanFp}${trojanSecurity}${trojanSid}${trojanPbk}${trojanSpx}${trojanMode}${trojanExtra}#${encodeURIComponent(
+                }${trojanTransport}${trojanAlpn}${trojanFp}${trojanPcs}${trojanSecurity}${trojanSid}${trojanPbk}${trojanSpx}${trojanMode}${trojanExtra}#${encodeURIComponent(
                     proxy.name,
                 )}`;
                 break;
@@ -803,11 +1300,15 @@ export default function URI_Producer() {
                             'port',
                             'ip',
                             'ipv6',
+                            'ip-cidr',
+                            'ipv6-cidr',
                             'private-key',
                         ].includes(key)
                     ) {
                         if (['public-key'].includes(key)) {
-                            wireguardParams.push(`publickey=${proxy[key]}`);
+                            wireguardParams.push(
+                                `publickey=${encodeURIComponent(proxy[key])}`,
+                            );
                         } else if (['udp'].includes(key)) {
                             if (proxy[key]) {
                                 wireguardParams.push(`${key}=1`);
@@ -819,14 +1320,28 @@ export default function URI_Producer() {
                         }
                     }
                 });
-                if (proxy.ip && proxy.ipv6) {
+                const wireguardIPv4 = getWireGuardAddressWithCIDR(
+                    proxy,
+                    'ipv4',
+                );
+                const wireguardIPv6 = getWireGuardAddressWithCIDR(
+                    proxy,
+                    'ipv6',
+                );
+                if (wireguardIPv4 && wireguardIPv6) {
                     wireguardParams.push(
-                        `address=${proxy.ip}/32,${proxy.ipv6}/128`,
+                        `address=${encodeURIComponent(
+                            `${wireguardIPv4},${wireguardIPv6}`,
+                        )}`,
                     );
-                } else if (proxy.ip) {
-                    wireguardParams.push(`address=${proxy.ip}/32`);
-                } else if (proxy.ipv6) {
-                    wireguardParams.push(`address=${proxy.ipv6}/128`);
+                } else if (wireguardIPv4) {
+                    wireguardParams.push(
+                        `address=${encodeURIComponent(wireguardIPv4)}`,
+                    );
+                } else if (wireguardIPv6) {
+                    wireguardParams.push(
+                        `address=${encodeURIComponent(wireguardIPv6)}`,
+                    );
                 }
                 result = `wireguard://${encodeURIComponent(
                     proxy['private-key'],

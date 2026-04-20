@@ -1,7 +1,4 @@
-import {
-    getPlatformFromHeaders,
-    shouldIncludeUnsupportedProxy,
-} from '@/utils/user-agent';
+import { getPlatformFromHeaders } from '@/utils/user-agent';
 import { ProxyUtils } from '@/core/proxy-utils';
 import { COLLECTIONS_KEY, SUBS_KEY } from '@/constants';
 import { findByName } from '@/utils/database';
@@ -14,6 +11,18 @@ import { produceArtifact } from '@/restful/sync';
 import { isIPv4, isIPv6 } from '@/utils';
 import { getISO } from '@/utils/geo';
 import env from '@/utils/env';
+
+function buildEmptyNezhaPayload() {
+    return JSON.stringify(
+        {
+            code: 0,
+            message: 'success',
+            result: [],
+        },
+        null,
+        2,
+    );
+}
 
 export default function register($app) {
     $app.get('/share/col/:name/:target', async (req, res) => {
@@ -92,7 +101,10 @@ async function downloadSubscription(req, res) {
     const useMihomoExternal = req.query.target === 'SurgeMac';
 
     const platform =
-        req.query.target || getPlatformFromHeaders(req.headers) || 'JSON';
+        req.query.platform ||
+        req.query.target ||
+        getPlatformFromHeaders(req.headers) ||
+        'JSON';
     const reqUA = req.headers['user-agent'] || req.headers['User-Agent'];
     $.info(
         `正在下载订阅：${name}\n请求 User-Agent: ${reqUA}\n请求 target: ${req.query.target}\n实际输出: ${platform}`,
@@ -110,6 +122,7 @@ async function downloadSubscription(req, res) {
         noCache,
         _fakeNode,
     } = req.query;
+    const prettyYaml = req.query.prettyYaml ?? req.query['pretty-yaml'];
 
     let $options = {
         _req: {
@@ -172,15 +185,8 @@ async function downloadSubscription(req, res) {
             `包含官方/商店版/未续费订阅不支持的协议: ${includeUnsupportedProxy}`,
         );
     }
-
-    if (
-        !includeUnsupportedProxy &&
-        shouldIncludeUnsupportedProxy(platform, req.headers)
-    ) {
-        includeUnsupportedProxy = true;
-        $.info(
-            `当前客户端可包含官方/商店版/未续费订阅不支持的协议: ${includeUnsupportedProxy}`,
-        );
+    if (prettyYaml) {
+        $.info(`指定输出易读 YAML: ${prettyYaml}`);
     }
 
     if (useMihomoExternal) {
@@ -221,6 +227,7 @@ async function downloadSubscription(req, res) {
                 produceOpts: {
                     'include-unsupported-proxy': includeUnsupportedProxy,
                     useMihomoExternal,
+                    prettyYaml,
                 },
                 $options,
                 proxy,
@@ -348,14 +355,18 @@ async function downloadSubscription(req, res) {
                 if (resultFormat === 'nezha') {
                     output = nezhaTransform(output);
                 } else if (resultFormat === 'nezha-monitor') {
-                    nezhaIndex = /^\d+$/.test(nezhaIndex)
-                        ? parseInt(nezhaIndex, 10)
-                        : output.findIndex((i) => i.name === nezhaIndex);
-                    output = await nezhaMonitor(
-                        output[nezhaIndex],
-                        nezhaIndex,
-                        req.query,
-                    );
+                    if (!Array.isArray(output) || output.length === 0) {
+                        output = buildEmptyNezhaPayload();
+                    } else {
+                        nezhaIndex = /^\d+$/.test(nezhaIndex)
+                            ? parseInt(nezhaIndex, 10)
+                            : output.findIndex((i) => i.name === nezhaIndex);
+                        output = await nezhaMonitor(
+                            output[nezhaIndex],
+                            nezhaIndex,
+                            req.query,
+                        );
+                    }
                 }
                 res.set('Content-Type', 'application/json;charset=utf-8');
             } else {
@@ -411,7 +422,10 @@ async function downloadCollection(req, res) {
     const useMihomoExternal = req.query.target === 'SurgeMac';
 
     const platform =
-        req.query.target || getPlatformFromHeaders(req.headers) || 'JSON';
+        req.query.platform ||
+        req.query.target ||
+        getPlatformFromHeaders(req.headers) ||
+        'JSON';
 
     const allCols = $.read(COLLECTIONS_KEY);
     const collection = findByName(allCols, name);
@@ -428,6 +442,7 @@ async function downloadCollection(req, res) {
         proxy,
         noCache,
     } = req.query;
+    const prettyYaml = req.query.prettyYaml ?? req.query['pretty-yaml'];
 
     let $options = {
         _req: {
@@ -476,15 +491,10 @@ async function downloadCollection(req, res) {
             `包含官方/商店版/未续费订阅不支持的协议: ${includeUnsupportedProxy}`,
         );
     }
-    if (
-        !includeUnsupportedProxy &&
-        shouldIncludeUnsupportedProxy(platform, req.headers)
-    ) {
-        includeUnsupportedProxy = true;
-        $.info(
-            `当前客户端可包含官方/商店版/未续费订阅不支持的协议: ${includeUnsupportedProxy}`,
-        );
+    if (prettyYaml) {
+        $.info(`指定输出易读 YAML: ${prettyYaml}`);
     }
+
     if (useMihomoExternal) {
         $.info(`手动指定了 target 为 SurgeMac, 将使用 Mihomo External`);
     }
@@ -503,6 +513,7 @@ async function downloadCollection(req, res) {
                 produceOpts: {
                     'include-unsupported-proxy': includeUnsupportedProxy,
                     useMihomoExternal,
+                    prettyYaml,
                 },
                 $options,
                 proxy,
@@ -638,14 +649,18 @@ async function downloadCollection(req, res) {
                 if (resultFormat === 'nezha') {
                     output = nezhaTransform(output);
                 } else if (resultFormat === 'nezha-monitor') {
-                    nezhaIndex = /^\d+$/.test(nezhaIndex)
-                        ? parseInt(nezhaIndex, 10)
-                        : output.findIndex((i) => i.name === nezhaIndex);
-                    output = await nezhaMonitor(
-                        output[nezhaIndex],
-                        nezhaIndex,
-                        req.query,
-                    );
+                    if (!Array.isArray(output) || output.length === 0) {
+                        output = buildEmptyNezhaPayload();
+                    } else {
+                        nezhaIndex = /^\d+$/.test(nezhaIndex)
+                            ? parseInt(nezhaIndex, 10)
+                            : output.findIndex((i) => i.name === nezhaIndex);
+                        output = await nezhaMonitor(
+                            output[nezhaIndex],
+                            nezhaIndex,
+                            req.query,
+                        );
+                    }
                 }
                 res.set('Content-Type', 'application/json;charset=utf-8');
             } else {

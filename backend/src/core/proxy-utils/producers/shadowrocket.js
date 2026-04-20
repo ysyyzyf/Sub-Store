@@ -1,4 +1,10 @@
-import { isPresent } from '@/core/proxy-utils/producers/utils';
+import {
+    getWireGuardAddressWithCIDR,
+    isPresent,
+    isShadowsocksOverTls,
+    produceProxyListOutput,
+    supportsShadowsocksV2rayPluginMode,
+} from '@/core/proxy-utils/producers/utils';
 import $ from '@/core/app';
 
 export default function Shadowrocket_Producer() {
@@ -7,10 +13,21 @@ export default function Shadowrocket_Producer() {
         const list = proxies
             .filter((proxy) => {
                 if (opts['include-unsupported-proxy']) return true;
-                if (proxy.type === 'snell' && proxy.version >= 4) {
+                if (
+                    !supportsShadowsocksV2rayPluginMode(proxy, [
+                        'websocket',
+                        'quic',
+                        'http2',
+                        'mkcp',
+                        'grpc',
+                    ])
+                ) {
+                    return false;
+                } else if (proxy.type === 'snell' && proxy.version >= 4) {
                     return false;
                 } else if (
                     [
+                        'tailscale',
                         'trusttunnel',
                         'mieru',
                         'sudoku',
@@ -130,6 +147,8 @@ export default function Shadowrocket_Producer() {
                     proxy['preshared-key'] =
                         proxy['preshared-key'] ?? proxy['pre-shared-key'];
                     proxy['pre-shared-key'] = proxy['preshared-key'];
+                    proxy.ip = getWireGuardAddressWithCIDR(proxy, 'ipv4');
+                    proxy.ipv6 = getWireGuardAddressWithCIDR(proxy, 'ipv6');
                 } else if (proxy.type === 'snell' && proxy.version < 3) {
                     delete proxy.udp;
                 } else if (proxy.type === 'vless') {
@@ -151,6 +170,13 @@ export default function Shadowrocket_Producer() {
                         delete proxy['shadow-tls-password'];
                         delete proxy['shadow-tls-sni'];
                         delete proxy['shadow-tls-version'];
+                    }
+                    if (isShadowsocksOverTls(proxy)) {
+                        if (isPresent(proxy, 'sni')) {
+                            proxy.servername = proxy.sni;
+                            // 先不删 没有明确的规范
+                            // delete proxy.sni;
+                        }
                     }
                 }
 
@@ -213,9 +239,11 @@ export default function Shadowrocket_Producer() {
                         proxy[`${proxy.network}-opts`].path = '/';
                     }
                 }
+
                 if (proxy['plugin-opts']?.tls) {
                     if (isPresent(proxy, 'skip-cert-verify')) {
                         proxy['plugin-opts']['skip-cert-verify'] =
+                            proxy['plugin-opts']['skip-cert-verify'] ||
                             proxy['skip-cert-verify'];
                     }
                 }
@@ -252,6 +280,8 @@ export default function Shadowrocket_Producer() {
                 delete proxy.id;
                 delete proxy.resolved;
                 delete proxy['no-resolve'];
+                delete proxy['ip-cidr'];
+                delete proxy['ipv6-cidr'];
                 if (type !== 'internal') {
                     for (const key in proxy) {
                         if (proxy[key] == null || /^_/i.test(key)) {
@@ -268,14 +298,7 @@ export default function Shadowrocket_Producer() {
                 }
                 return proxy;
             });
-        return type === 'internal'
-            ? list
-            : 'proxies:\n' +
-                  list
-                      .map((proxy) => {
-                          return '  - ' + JSON.stringify(proxy) + '\n';
-                      })
-                      .join('');
+        return produceProxyListOutput(list, type, opts);
     };
     return { type, produce };
 }

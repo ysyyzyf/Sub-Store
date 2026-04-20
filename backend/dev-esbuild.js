@@ -13,6 +13,9 @@ const { build } = require('esbuild');
             platform: 'node',
             format: 'cjs',
             outfile: artifact.dest,
+            logOverride: {
+                'direct-eval': 'silent',
+            },
         });
     }
 })()
